@@ -43,6 +43,13 @@ def get_callpeak_parser() -> argparse.ArgumentParser:
         help="Library strandedness type",
     )
     strand_group.add_argument(
+        "--read", type=str, default="1", choices=("1", "2", "both"),
+        help="Which read to use for PE data: '1' (R1, default), '2' (R2, "
+        "useful for eCLIP), or 'both'. With -f BAM, MACS3 treats every "
+        "read as an independent tag; using R1-only gives sharper peaks "
+        "for RNA-seq. Ignored for SE libtypes (F/R).",
+    )
+    strand_group.add_argument(
         "--chrom-sizes",
         help="Chromsizes file or shortcut (hg38, mm10) for bdg-to-bigwig conversion",
     )

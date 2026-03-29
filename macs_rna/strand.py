@@ -57,6 +57,7 @@ def split_bam_by_strand(
     bam: str,
     libtype: Literal["FR", "RF", "F", "R"],
     prefix: str,
+    read: str = "1",
     min_mapq: int = 0,
     primary: bool = False,
     n_jobs: int = 8,
@@ -72,6 +73,10 @@ def split_bam_by_strand(
         Library strandedness type.
     prefix : str
         Output prefix. Produces {prefix}.fwd.bam and {prefix}.rev.bam.
+    read : {'1', '2', 'both'}
+        Which read to keep for PE data. '1' = R1 only (flag 64),
+        '2' = R2 only (flag 128), 'both' = all reads.
+        Ignored for SE libtypes (F/R).
     min_mapq : int
         Minimum mapping quality filter.
     primary : bool
@@ -89,6 +94,13 @@ def split_bam_by_strand(
     if libtype not in _STRAND_FILTERS:
         raise ValueError(f"Unknown libtype: {libtype}. Must be one of {list(_STRAND_FILTERS.keys())}")
 
+    is_pe = libtype in ("FR", "RF")
+
+    if not is_pe and read != "both":
+        logger.warning(
+            "--read %s is ignored for single-end libtype %s", read, libtype,
+        )
+
     fwd_bam = f"{prefix}.fwd.bam"
     rev_bam = f"{prefix}.rev.bam"
 
@@ -96,11 +108,16 @@ def split_bam_by_strand(
         filters = _STRAND_FILTERS[libtype][strand]
 
         # Build samtools view command
-        parts = ["samtools", "view", "-b", f"-@ {n_jobs}", f"-h"]
+        parts = ["samtools", "view", "-b", f"-@ {n_jobs}", "-h"]
         if min_mapq > 0:
             parts.append(f"-q {min_mapq}")
         if primary:
             parts.append("-F 256")
+        # PE read selection: -f 64 (R1) or -f 128 (R2)
+        if is_pe and read == "1":
+            parts.append("-f 64")
+        elif is_pe and read == "2":
+            parts.append("-f 128")
         parts.extend(filters)
         parts.append(bam)
         parts.append(f"-o {out_bam}")
@@ -111,5 +128,6 @@ def split_bam_by_strand(
         # Index the output BAM
         run_cmd(f"samtools index -@ {n_jobs} {out_bam}", dry_run=dry_run)
 
-    logger.info("Split %s -> %s, %s", bam, fwd_bam, rev_bam)
+    read_label = f" (R{read})" if is_pe and read != "both" else ""
+    logger.info("Split %s -> %s, %s%s", bam, fwd_bam, rev_bam, read_label)
     return fwd_bam, rev_bam

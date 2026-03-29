@@ -106,6 +106,7 @@ def _run_pipeline(
         bam=args.treatment[0],
         libtype=args.libtype,
         prefix=treat_prefix,
+        read=args.read,
         min_mapq=args.min_mapq,
         primary=args.primary,
         n_jobs=args.n_jobs,
@@ -120,6 +121,7 @@ def _run_pipeline(
             bam=args.control[0],
             libtype=args.libtype,
             prefix=ctrl_prefix,
+            read=args.read,
             min_mapq=args.min_mapq,
             primary=args.primary,
             n_jobs=args.n_jobs,
@@ -130,20 +132,24 @@ def _run_pipeline(
     logger.info("=== Step 2/5: Counting reads ===")
 
     if not dry_run:
-        total_treat = count_reads(args.treatment[0])
-        total_treat_M = total_treat / 1e6
-        logger.info("Total treatment reads: %d (%.3f M)", total_treat, total_treat_M)
-
         strand_treat_counts = {
             "fwd": count_reads(treat_fwd),
             "rev": count_reads(treat_rev),
         }
+        # Total = sum of strand counts (already filtered by --read)
+        total_treat = strand_treat_counts["fwd"] + strand_treat_counts["rev"]
+        total_treat_M = total_treat / 1e6
+        logger.info("Total treatment reads (after --read %s filter): %d (%.3f M)",
+                     args.read, total_treat, total_treat_M)
         for s, c in strand_treat_counts.items():
-            logger.info("  %s strand treatment reads: %d (%.3f M)", s, c, c / 1e6)
+            logger.info("  %s strand: %d (%.3f M)", s, c, c / 1e6)
 
         if args.control is not None:
-            total_ctrl = count_reads(args.control[0])
-            logger.info("Total control reads: %d (%.3f M)", total_ctrl, total_ctrl / 1e6)
+            ctrl_fwd_n = count_reads(ctrl_fwd)
+            ctrl_rev_n = count_reads(ctrl_rev)
+            total_ctrl = ctrl_fwd_n + ctrl_rev_n
+            logger.info("Total control reads (after --read %s filter): %d (%.3f M)",
+                         args.read, total_ctrl, total_ctrl / 1e6)
     else:
         total_treat = 0
         total_treat_M = 1.0  # placeholder for dry-run
