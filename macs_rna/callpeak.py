@@ -38,6 +38,15 @@ def run_callpeak(args: argparse.Namespace) -> None:
 
     setup_logging(args.verbose)
 
+    # Warn about format pitfalls for RNA-seq
+    if args.format == "AUTO":
+        logger.warning(
+            "Using AUTO format detection. For paired-end RNA-seq, MACS3 may "
+            "auto-detect BAMPE which uses fragment coordinates spanning introns. "
+            "This produces incorrect pileup for spliced reads. "
+            "Please use -f BAM with --nomodel --extsize instead."
+        )
+
     outdir = os.path.abspath(args.outdir)
     os.makedirs(outdir, exist_ok=True)
     name = args.name
