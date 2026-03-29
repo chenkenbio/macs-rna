@@ -16,6 +16,7 @@ import argparse
 import logging
 import math
 import os
+import shlex
 import shutil
 import tempfile
 from typing import Optional
@@ -65,8 +66,8 @@ def run_callpeak(args: argparse.Namespace) -> None:
     try:
         _run_pipeline(args, outdir, name, tmpdir, chrom_sizes, dry_run)
     finally:
-        # Clean up temp directory
-        if not dry_run and os.path.exists(tmpdir):
+        # Always clean up temp directory (including dry-run)
+        if os.path.exists(tmpdir):
             shutil.rmtree(tmpdir)
             logger.info("Cleaned up temp directory: %s", tmpdir)
 
@@ -103,7 +104,7 @@ def _run_pipeline(
 
     treat_prefix = os.path.join(tmpdir, f"{name}_treat")
     treat_fwd, treat_rev = split_bam_by_strand(
-        bam=args.treatment[0],
+        bam=args.treatment,
         libtype=args.libtype,
         prefix=treat_prefix,
         read=args.read,
@@ -118,7 +119,7 @@ def _run_pipeline(
     if args.control is not None:
         ctrl_prefix = os.path.join(tmpdir, f"{name}_ctrl")
         ctrl_fwd, ctrl_rev = split_bam_by_strand(
-            bam=args.control[0],
+            bam=args.control,
             libtype=args.libtype,
             prefix=ctrl_prefix,
             read=args.read,
@@ -144,12 +145,21 @@ def _run_pipeline(
         for s, c in strand_treat_counts.items():
             logger.info("  %s strand: %d (%.3f M)", s, c, c / 1e6)
 
+        if total_treat == 0:
+            raise RuntimeError(
+                "Zero treatment reads after strand splitting and --read filter. "
+                "Check that the BAM is not empty, the --libtype matches the "
+                "library, and --read is appropriate for the data."
+            )
+
         if args.control is not None:
             ctrl_fwd_n = count_reads(ctrl_fwd)
             ctrl_rev_n = count_reads(ctrl_rev)
             total_ctrl = ctrl_fwd_n + ctrl_rev_n
             logger.info("Total control reads (after --read %s filter): %d (%.3f M)",
                          args.read, total_ctrl, total_ctrl / 1e6)
+            if total_ctrl == 0:
+                raise RuntimeError("Zero control reads after strand splitting and --read filter.")
     else:
         total_treat = 0
         total_treat_M = 1.0  # placeholder for dry-run
@@ -237,7 +247,7 @@ def _estimate_fragment_size(args: argparse.Namespace, dry_run: bool) -> Optional
     """
     cmd = (
         f"{args.macs_path} predictd"
-        f" -i {args.treatment[0]}"
+        f" -i {shlex.quote(args.treatment)}"
         f" -f {args.format}"
         f" -g {args.gsize}"
     )
@@ -250,7 +260,6 @@ def _estimate_fragment_size(args: argparse.Namespace, dry_run: bool) -> Optional
     output = (result.stderr or "") + (result.stdout or "")
     for line in output.splitlines():
         if "predicted fragment length" in line.lower() or "# d =" in line.lower():
-            # Extract the number
             for token in line.split():
                 try:
                     d = int(token)
@@ -260,7 +269,11 @@ def _estimate_fragment_size(args: argparse.Namespace, dry_run: bool) -> Optional
                 except ValueError:
                     continue
 
-    logger.warning("Could not parse fragment size from predictd output, using default 200")
+    logger.warning(
+        "Could not parse fragment size from predictd output. "
+        "Falling back to extsize=200. predictd output:\n%s",
+        output.strip() or "(empty)",
+    )
     return 200
 
 
@@ -297,11 +310,11 @@ def _run_macs3_callpeak(
     """
     cmd_parts = [
         args.macs_path, "callpeak",
-        f"-t {treatment}",
-        f"-f {args.format}",
+        f"-t {shlex.quote(treatment)}",
+        "-f BAM",  # strand-split output is always BAM
         f"-g {args.gsize}",
-        f"-n {name}",
-        f"--outdir {outdir}",
+        f"-n {shlex.quote(name)}",
+        f"--outdir {shlex.quote(outdir)}",
         f"--keep-dup {args.keep_dup}",
         f"--scale-to {args.scale_to}",
         "-B",  # always generate bedGraphs for re-scoring
@@ -312,7 +325,7 @@ def _run_macs3_callpeak(
         cmd_parts.append("--SPMR")
 
     if control is not None:
-        cmd_parts.append(f"-c {control}")
+        cmd_parts.append(f"-c {shlex.quote(control)}")
 
     # Fragment size handling
     if args.nomodel or extsize is not None:
@@ -474,21 +487,23 @@ def _rescale_and_call_peaks(
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
         cmd_parts = [
             f"{args.macs_path} bdgbroadcall",
-            f"-i {score_bdg}",
+            f"-i {shlex.quote(score_bdg)}",
             f"-c {cutoff:.4f}",
             f"-C {-math.log10(args.broad_cutoff):.4f}",
-            f"-o {peak_file}",
+            f"-o {shlex.quote(peak_file)}",
         ]
         if args.min_length is not None:
             cmd_parts.append(f"-l {args.min_length}")
+        if args.max_gap is not None:
+            cmd_parts.append(f"-g {args.max_gap}")
     else:
         peak_suffix = "narrowPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
         cmd_parts = [
             f"{args.macs_path} bdgpeakcall",
-            f"-i {score_bdg}",
+            f"-i {shlex.quote(score_bdg)}",
             f"-c {cutoff:.4f}",
-            f"-o {peak_file}",
+            f"-o {shlex.quote(peak_file)}",
         ]
         if args.min_length is not None:
             cmd_parts.append(f"-l {args.min_length}")
@@ -551,6 +566,9 @@ def _handle_bdg_output(
             if chrom_sizes is not None:
                 bw_path = final_bdg.removesuffix(".bdg") + ".bw"
                 bdg_to_bigwig(final_bdg, bw_path, chrom_sizes)
+                # Remove bdg after successful bigwig conversion
+                os.remove(final_bdg)
+                logger.info("Removed %s (bigwig created)", os.path.basename(final_bdg))
         # else: bdg stays in tmpdir and is cleaned up automatically
 
 
@@ -601,5 +619,5 @@ def _combine_strand_peaks(
                     out_f.write("\t".join(fields) + "\n")
 
     # Sort by chr, start
-    run_cmd(f"sort -k1,1 -k2,2n -o {combined} {combined}")
+    run_cmd(f"sort -k1,1 -k2,2n -o {shlex.quote(combined)} {shlex.quote(combined)}")
     logger.info("Combined peaks written to: %s", combined)

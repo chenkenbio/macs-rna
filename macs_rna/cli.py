@@ -82,12 +82,12 @@ def get_callpeak_parser() -> argparse.ArgumentParser:
     # --- MACS3 callpeak arguments (passthrough) ---
     required_group = p.add_argument_group("Required MACS3 arguments")
     required_group.add_argument(
-        "-t", "--treatment", nargs="+", required=True,
-        help="Treatment BAM/BED file(s)",
+        "-t", "--treatment", required=True,
+        help="Treatment BAM file",
     )
     required_group.add_argument(
-        "-c", "--control", nargs="+", default=None,
-        help="Control BAM/BED file(s)",
+        "-c", "--control", default=None,
+        help="Control BAM file",
     )
     required_group.add_argument(
         "-n", "--name", required=True,
@@ -99,10 +99,11 @@ def get_callpeak_parser() -> argparse.ArgumentParser:
     )
     required_group.add_argument(
         "-f", "--format",
-        choices=("AUTO", "BAM", "SAM", "BED", "BEDPE"),
+        choices=("AUTO", "BAM", "SAM"),
         default=None, required=True,
-        help="Input file format (BAMPE is excluded: RNA-seq reads are spliced, "
-        "so paired-end data should use BAM with --nomodel --extsize)",
+        help="Input file format. BAMPE/BED/BEDPE are not supported: "
+        "strand splitting requires BAM/SAM input, and BAMPE spans introns "
+        "in spliced RNA-seq reads. Use -f BAM with --nomodel --extsize.",
     )
     required_group.add_argument(
         "-g", "--gsize", default="hs",
@@ -149,10 +150,6 @@ def get_callpeak_parser() -> argparse.ArgumentParser:
     opt_group.add_argument(
         "--broad-cutoff", type=float, default=0.1,
         help="Cutoff for broad region linking",
-    )
-    opt_group.add_argument(
-        "--call-summits", action="store_true",
-        help="Call summits of peaks (only used in initial macs3 callpeak run)",
     )
     opt_group.add_argument(
         "--shift", type=int, default=None,

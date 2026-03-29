@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -72,20 +73,24 @@ def run_cmd(
     return result
 
 
-def count_reads(bam: str) -> int:
+def count_reads(bam: str, exclude_supplementary: bool = True) -> int:
     """Count mapped reads in a BAM file using samtools.
 
     Parameters
     ----------
     bam : str
         Path to BAM file.
+    exclude_supplementary : bool
+        If True, also exclude supplementary alignments (flag 2048).
 
     Returns
     -------
     int
-        Number of mapped reads (excludes unmapped, flag 4).
+        Number of mapped reads.
     """
-    result = run_cmd(f"samtools view -c -F 4 {bam}", capture=True)
+    # -F 4: exclude unmapped; -F 2048: exclude supplementary
+    flag = 2052 if exclude_supplementary else 4
+    result = run_cmd(f"samtools view -c -F {flag} {shlex.quote(bam)}", capture=True)
     return int(result.stdout.strip())
 
 
@@ -140,9 +145,6 @@ def bdg_to_bigwig(
 ) -> None:
     """Convert a bedGraph file to bigWig format.
 
-    Sorts the bedGraph, converts via bedGraphToBigWig, then removes the
-    original bdg file.
-
     Parameters
     ----------
     bdg : str
@@ -154,9 +156,11 @@ def bdg_to_bigwig(
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         sorted_bdg = os.path.join(tmpdir, "sorted.bdg")
-        run_cmd(f"sort -k1,1 -k2,2n {bdg} > {sorted_bdg}")
-        run_cmd(f"bedGraphToBigWig {sorted_bdg} {chrom_sizes} {bw}")
-
-    # Remove original bdg after successful conversion
-    os.remove(bdg)
-    logger.info("Converted %s -> %s (bdg removed)", bdg, bw)
+        run_cmd(
+            f"sort -k1,1 -k2,2n {shlex.quote(bdg)} > {shlex.quote(sorted_bdg)}"
+        )
+        run_cmd(
+            f"bedGraphToBigWig {shlex.quote(sorted_bdg)}"
+            f" {shlex.quote(chrom_sizes)} {shlex.quote(bw)}"
+        )
+    logger.info("Converted %s -> %s", bdg, bw)

@@ -6,6 +6,7 @@ strand-specific reads from RNA-seq BAM files.
 
 import logging
 import os
+import shlex
 from typing import Literal, Optional
 
 from macs_rna.utils import run_cmd
@@ -80,7 +81,8 @@ def split_bam_by_strand(
     min_mapq : int
         Minimum mapping quality filter.
     primary : bool
-        If True, only keep primary alignments (exclude flag 256).
+        If True, only keep primary alignments (exclude secondary 0x100
+        and supplementary 0x800 alignments).
     n_jobs : int
         Number of threads for samtools.
     dry_run : bool
@@ -112,21 +114,22 @@ def split_bam_by_strand(
         if min_mapq > 0:
             parts.append(f"-q {min_mapq}")
         if primary:
-            parts.append("-F 256")
+            # 2304 = 256 (secondary) + 2048 (supplementary)
+            parts.append("-F 2304")
         # PE read selection: -f 64 (R1) or -f 128 (R2)
         if is_pe and read == "1":
             parts.append("-f 64")
         elif is_pe and read == "2":
             parts.append("-f 128")
         parts.extend(filters)
-        parts.append(bam)
-        parts.append(f"-o {out_bam}")
+        parts.append(shlex.quote(bam))
+        parts.append(f"-o {shlex.quote(out_bam)}")
 
         cmd = " ".join(parts)
         run_cmd(cmd, dry_run=dry_run)
 
         # Index the output BAM
-        run_cmd(f"samtools index -@ {n_jobs} {out_bam}", dry_run=dry_run)
+        run_cmd(f"samtools index -@ {n_jobs} {shlex.quote(out_bam)}", dry_run=dry_run)
 
     read_label = f" (R{read})" if is_pe and read != "both" else ""
     logger.info("Split %s -> %s, %s%s", bam, fwd_bam, rev_bam, read_label)

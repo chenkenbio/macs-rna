@@ -71,7 +71,11 @@ macs-rna callpeak \
 | `--mode {m6A-MeRIP,seCLIP}` | Preset recipe for common experiment types |
 | `--dry-run` | Print all commands without executing |
 
-All standard `macs3 callpeak` arguments (`-t`, `-c`, `-f`, `-g`, `--keep-dup`, `--nomodel`, `--extsize`, `-q`/`-p`, `--broad`, etc.) are supported. `BAMPE` is excluded from `-f` choices — use `-f BAM` with `--nomodel --extsize` for PE RNA-seq data.
+Most `macs3 callpeak` arguments (`-t`, `-c`, `-f`, `-g`, `--keep-dup`, `--nomodel`, `--extsize`, `-q`/`-p`, `--broad`, etc.) are supported. Notable differences from macs3:
+- `-f` only accepts `AUTO`, `BAM`, `SAM` (no BAMPE/BED/BEDPE — strand splitting requires BAM/SAM)
+- `-t` and `-c` accept a single file each (no multi-file pooling)
+- `--call-summits` is not available (incompatible with the step-by-step rescaling pipeline)
+- `--primary` excludes both secondary (0x100) and supplementary (0x800) alignments
 
 ### Dry-run
 
