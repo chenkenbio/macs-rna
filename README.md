@@ -10,10 +10,13 @@ Running `macs3 callpeak` independently on each strand after splitting a BAM intr
 
 `macs-rna` splits BAMs by strand but uses the **total reads across both strands** as the effective library size for the Poisson test. This is achieved via a step-by-step MACS3 pipeline:
 
-1. `macs3 callpeak --SPMR -B` per strand — generates SPMR-normalized bedGraphs
-2. `macs3 bdgcmp -S {total_reads_in_millions}` — re-scores with global scaling
-3. `macs3 bdgopt -m p2q` — BH-corrected q-values (when using `-q` cutoff)
-4. `macs3 bdgpeakcall` / `bdgbroadcall` — final peak calling with equalized sensitivity
+1. `macs3 callpeak -B` per strand — generates bedGraph pileup and lambda tracks
+2. `macs3 bdgopt -m multiply -p {total/strand}` — scales bedGraphs to total library size
+3. `macs3 bdgcmp -m ppois` — computes Poisson p-value scores
+4. `macs3 bdgopt -m p2q` — BH-corrected q-values (when using `-q` cutoff)
+5. `macs3 bdgpeakcall` / `bdgbroadcall` — final peak calling with equalized sensitivity
+
+When `--SPMR` is passed, the scaling is done via `bdgcmp -S {total_reads_in_millions}` on SPMR-normalized bedGraphs instead.
 
 ## Installation
 
@@ -78,7 +81,9 @@ macs-rna callpeak \
 
 ## How scaling works
 
-SPMR normalizes pileup to "per million strand reads." When both strands are re-scaled via `bdgcmp -S {total_reads_M}`, the effective library size becomes identical for both strands, giving the Poisson test equal statistical power regardless of per-strand read distribution.
+By default, both the treatment pileup and control lambda bedGraphs are multiplied by `total_treatment_reads / strand_treatment_reads` using `bdgopt -m multiply`. This inflates the per-strand counts to match the total library size, giving the Poisson test equal statistical power regardless of per-strand read distribution.
+
+With `--SPMR`, SPMR normalizes pileup to "per million strand reads," and `bdgcmp -S {total_reads_M}` converts back to effective counts at the total library size.
 
 ## License
 

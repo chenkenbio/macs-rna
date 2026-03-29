@@ -4,8 +4,9 @@ Workflow:
 1. Split treatment (and control) BAMs by strand
 2. Count total reads across both strands for global scaling
 3. For each strand:
-   a. Run macs3 callpeak --SPMR -B to generate normalized bedGraphs
-   b. Re-score with macs3 bdgcmp using total-reads scaling factor
+   a. Run macs3 callpeak -B to generate bedGraphs
+   b. Re-score with global scaling (bdgopt multiply + bdgcmp, or
+      bdgcmp -S when --SPMR)
    c. Convert p-values to q-values if needed (macs3 bdgopt -m p2q)
    d. Call peaks with macs3 bdgpeakcall / bdgbroadcall
 4. Set strand in peak files, combine, convert bdg to bigwig
@@ -86,6 +87,8 @@ def _run_pipeline(
     dry_run : bool
         If True, print commands without executing.
     """
+    use_spmr = args.SPMR
+
     # --- Step 1: Split BAMs by strand ---
     logger.info("=== Step 1/5: Splitting BAMs by strand ===")
 
@@ -114,20 +117,29 @@ def _run_pipeline(
             dry_run=dry_run,
         )
 
-    # --- Step 2: Count total reads (before splitting) ---
-    logger.info("=== Step 2/5: Counting total reads ===")
+    # --- Step 2: Count total and per-strand reads ---
+    logger.info("=== Step 2/5: Counting reads ===")
 
     if not dry_run:
         total_treat = count_reads(args.treatment[0])
         total_treat_M = total_treat / 1e6
         logger.info("Total treatment reads: %d (%.3f M)", total_treat, total_treat_M)
 
+        strand_treat_counts = {
+            "fwd": count_reads(treat_fwd),
+            "rev": count_reads(treat_rev),
+        }
+        for s, c in strand_treat_counts.items():
+            logger.info("  %s strand treatment reads: %d (%.3f M)", s, c, c / 1e6)
+
         if args.control is not None:
             total_ctrl = count_reads(args.control[0])
             logger.info("Total control reads: %d (%.3f M)", total_ctrl, total_ctrl / 1e6)
     else:
+        total_treat = 0
         total_treat_M = 1.0  # placeholder for dry-run
-        logger.info("Dry-run: using placeholder total_treat_M=1.0")
+        strand_treat_counts = {"fwd": 0, "rev": 0}
+        logger.info("Dry-run: using placeholder values")
 
     # --- Step 3: Estimate fragment size if needed ---
     extsize = args.extsize
@@ -151,7 +163,7 @@ def _run_pipeline(
 
         strand_prefix = f"{name}_{strand_name}"
 
-        # 3a. Run macs3 callpeak to generate SPMR bedGraphs
+        # 4a. Run macs3 callpeak to generate bedGraphs
         _run_macs3_callpeak(
             args=args,
             treatment=t_bam,
@@ -162,12 +174,16 @@ def _run_pipeline(
             dry_run=dry_run,
         )
 
-        # 3b-3d. Re-score and call peaks with global scaling
+        # 4b-4d. Re-score and call peaks with global scaling
+        strand_reads = strand_treat_counts[strand_name]
         peak_file = _rescale_and_call_peaks(
             strand_dir=strand_dir,
             strand_prefix=strand_prefix,
             outdir=outdir,
+            total_treat=total_treat,
             total_treat_M=total_treat_M,
+            strand_treat=strand_reads,
+            use_spmr=use_spmr,
             args=args,
             dry_run=dry_run,
         )
@@ -180,6 +196,7 @@ def _run_pipeline(
             outdir=outdir,
             chrom_sizes=chrom_sizes,
             user_requested_bdg=args.bdg or args.SPMR,
+            is_spmr=use_spmr,
             dry_run=dry_run,
         )
 
@@ -241,7 +258,7 @@ def _run_macs3_callpeak(
     extsize: Optional[int],
     dry_run: bool,
 ) -> None:
-    """Run macs3 callpeak with --SPMR -B to generate normalized bedGraphs.
+    """Run macs3 callpeak with -B to generate bedGraphs for re-scoring.
 
     The peaks from this run use per-strand scaling and are NOT the final
     output. We only use the bedGraph files for re-scoring.
@@ -272,8 +289,12 @@ def _run_macs3_callpeak(
         f"--outdir {outdir}",
         f"--keep-dup {args.keep_dup}",
         f"--scale-to {args.scale_to}",
-        "-B --SPMR",  # always generate SPMR bedGraphs
+        "-B",  # always generate bedGraphs for re-scoring
     ]
+
+    # Only add --SPMR if user explicitly requested it
+    if args.SPMR:
+        cmd_parts.append("--SPMR")
 
     if control is not None:
         cmd_parts.append(f"-c {control}")
@@ -319,11 +340,19 @@ def _rescale_and_call_peaks(
     strand_dir: str,
     strand_prefix: str,
     outdir: str,
+    total_treat: int,
     total_treat_M: float,
+    strand_treat: int,
+    use_spmr: bool,
     args: argparse.Namespace,
     dry_run: bool,
 ) -> str:
     """Re-score bedGraphs with global scaling and call peaks.
+
+    Two modes:
+    - Raw (default): scale treat/ctrl bedGraphs by total_treat/strand_treat
+      via bdgopt multiply, then bdgcmp with default S=1.0.
+    - SPMR (--SPMR): use bdgcmp -S total_treat_M directly on SPMR bedGraphs.
 
     Parameters
     ----------
@@ -333,8 +362,14 @@ def _rescale_and_call_peaks(
         Name prefix (e.g., 'experiment_fwd').
     outdir : str
         Final output directory for peak files.
+    total_treat : int
+        Total treatment reads (both strands).
     total_treat_M : float
-        Total treatment reads in millions (the global scaling factor).
+        Total treatment reads in millions.
+    strand_treat : int
+        Treatment reads in this strand.
+    use_spmr : bool
+        Whether --SPMR was passed by the user.
     args : argparse.Namespace
         Parsed CLI arguments.
     dry_run : bool
@@ -348,19 +383,58 @@ def _rescale_and_call_peaks(
     treat_bdg = os.path.join(strand_dir, f"{strand_prefix}_treat_pileup.bdg")
     ctrl_bdg = os.path.join(strand_dir, f"{strand_prefix}_control_lambda.bdg")
 
-    # 3b. Re-score with global scaling using bdgcmp
-    ppois_bdg = os.path.join(strand_dir, f"{strand_prefix}_ppois.bdg")
-    run_cmd(
-        f"{args.macs_path} bdgcmp"
-        f" -t {treat_bdg}"
-        f" -c {ctrl_bdg}"
-        f" -S {total_treat_M:.6f}"
-        f" -m ppois"
-        f" -o {ppois_bdg}",
-        dry_run=dry_run,
-    )
+    if use_spmr:
+        # SPMR mode: bedGraphs are per-million-reads normalized,
+        # use bdgcmp -S to set effective library size to total reads
+        bdgcmp_treat = treat_bdg
+        bdgcmp_ctrl = ctrl_bdg
+        scaling_flag = f"-S {total_treat_M:.6f}"
+    else:
+        # Raw mode: scale both bedGraphs by total/strand to equalize
+        # effective library size across strands
+        if strand_treat > 0 and total_treat > 0:
+            scale_factor = total_treat / strand_treat
+        else:
+            scale_factor = 1.0
+        logger.info(
+            "Scaling factor for %s: %.4f (total=%d, strand=%d)",
+            strand_prefix, scale_factor, total_treat, strand_treat,
+        )
 
-    # 3c. Determine score track and cutoff for peak calling
+        bdgcmp_treat = os.path.join(strand_dir, f"{strand_prefix}_treat_scaled.bdg")
+        bdgcmp_ctrl = os.path.join(strand_dir, f"{strand_prefix}_ctrl_scaled.bdg")
+
+        run_cmd(
+            f"{args.macs_path} bdgopt"
+            f" -i {treat_bdg}"
+            f" -m multiply"
+            f" -p {scale_factor:.6f}"
+            f" -o {bdgcmp_treat}",
+            dry_run=dry_run,
+        )
+        run_cmd(
+            f"{args.macs_path} bdgopt"
+            f" -i {ctrl_bdg}"
+            f" -m multiply"
+            f" -p {scale_factor:.6f}"
+            f" -o {bdgcmp_ctrl}",
+            dry_run=dry_run,
+        )
+        scaling_flag = ""  # default S=1.0
+
+    # Re-score with bdgcmp
+    ppois_bdg = os.path.join(strand_dir, f"{strand_prefix}_ppois.bdg")
+    bdgcmp_cmd = (
+        f"{args.macs_path} bdgcmp"
+        f" -t {bdgcmp_treat}"
+        f" -c {bdgcmp_ctrl}"
+    )
+    if scaling_flag:
+        bdgcmp_cmd += f" {scaling_flag}"
+    bdgcmp_cmd += f" -m ppois -o {ppois_bdg}"
+    run_cmd(bdgcmp_cmd, dry_run=dry_run)
+
+    # Determine score track and cutoff for peak calling
     if args.pvalue is not None:
         # Use p-value scores directly
         score_bdg = ppois_bdg
@@ -379,7 +453,7 @@ def _rescale_and_call_peaks(
         score_bdg = qvalue_bdg
         cutoff = -math.log10(qval)
 
-    # 3d. Call peaks from score track
+    # Call peaks from score track
     if args.broad:
         peak_suffix = "broadPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
@@ -416,6 +490,7 @@ def _handle_bdg_output(
     outdir: str,
     chrom_sizes: Optional[str],
     user_requested_bdg: bool,
+    is_spmr: bool,
     dry_run: bool,
 ) -> None:
     """Convert bedGraph files to bigWig or gzip, then clean up.
@@ -432,6 +507,8 @@ def _handle_bdg_output(
         Path to chromsizes file, or None to skip bigwig conversion.
     user_requested_bdg : bool
         Whether the user explicitly requested -B/--SPMR output.
+    is_spmr : bool
+        Whether the bedGraphs are SPMR-normalized.
     dry_run : bool
         If True, skip file operations.
     """
@@ -443,25 +520,23 @@ def _handle_bdg_output(
         "control_lambda": os.path.join(strand_dir, f"{strand_prefix}_control_lambda.bdg"),
     }
 
+    # Tag for filename: explicitly label SPMR vs raw
+    tag = ".SPMR" if is_spmr else ""
+
     for label, bdg_path in bdg_files.items():
         if not os.path.exists(bdg_path):
             continue
 
-        # Rename with .SPMR. to clarify the normalization type
-        spmr_bdg = bdg_path.replace(f"_{label}.bdg", f"_{label}.SPMR.bdg")
-        os.rename(bdg_path, spmr_bdg)
-
         if user_requested_bdg:
-            # Move to outdir and convert to bigwig if possible
-            final_bdg = os.path.join(outdir, os.path.basename(spmr_bdg))
-            shutil.move(spmr_bdg, final_bdg)
+            # Rename with normalization tag for clarity
+            tagged_name = f"{strand_prefix}_{label}{tag}.bdg"
+            final_bdg = os.path.join(outdir, tagged_name)
+            shutil.move(bdg_path, final_bdg)
 
             if chrom_sizes is not None:
-                bw_path = final_bdg.replace(".SPMR.bdg", ".SPMR.bw")
+                bw_path = final_bdg.removesuffix(".bdg") + ".bw"
                 bdg_to_bigwig(final_bdg, bw_path, chrom_sizes)
-        else:
-            # User didn't request bdg output; just delete
-            os.remove(spmr_bdg)
+        # else: bdg stays in tmpdir and is cleaned up automatically
 
 
 def _combine_strand_peaks(
