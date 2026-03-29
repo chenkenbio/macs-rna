@@ -257,7 +257,7 @@ def _estimate_fragment_size(args: argparse.Namespace, dry_run: bool) -> Optional
         Predicted fragment size, or None if dry_run.
     """
     cmd = (
-        f"{args.macs_path} predictd"
+        f"{shlex.quote(args.macs_path)} predictd"
         f" -i {shlex.quote(args.treatment)}"
         f" -f {args.format}"
         f" -g {args.gsize}"
@@ -329,7 +329,7 @@ def _run_macs3_callpeak(
         run_cmd(f"bedtools bamtobed -i {shlex.quote(control)} > {shlex.quote(control_bed)}", dry_run=dry_run)
 
     cmd_parts = [
-        args.macs_path, "callpeak",
+        shlex.quote(args.macs_path), "callpeak",
         f"-t {shlex.quote(treatment_bed)}",
         "-f BED",
         f"-g {args.gsize}",
@@ -507,7 +507,7 @@ def _rescale_and_call_peaks(
         peak_suffix = "broadPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
         cmd_parts = [
-            f"{args.macs_path} bdgbroadcall",
+            f"{shlex.quote(args.macs_path)} bdgbroadcall",
             f"-i {shlex.quote(score_bdg)}",
             f"-c {cutoff:.4f}",
             f"-C {-math.log10(args.broad_cutoff):.4f}",
@@ -523,7 +523,7 @@ def _rescale_and_call_peaks(
         peak_suffix = "narrowPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
         cmd_parts = [
-            f"{args.macs_path} bdgpeakcall",
+            f"{shlex.quote(args.macs_path)} bdgpeakcall",
             f"-i {shlex.quote(score_bdg)}",
             f"-c {cutoff:.4f}",
             f"-o {shlex.quote(peak_file)}",
