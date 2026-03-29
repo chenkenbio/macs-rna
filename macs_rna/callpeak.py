@@ -574,10 +574,12 @@ def _handle_bdg_output(
 
             if chrom_sizes is not None:
                 bw_path = final_bdg.removesuffix(".bdg") + ".bw"
-                bdg_to_bigwig(final_bdg, bw_path, chrom_sizes)
-                # Remove bdg after successful bigwig conversion
-                os.remove(final_bdg)
-                logger.info("Removed %s (bigwig created)", os.path.basename(final_bdg))
+                try:
+                    bdg_to_bigwig(final_bdg, bw_path, chrom_sizes)
+                    os.remove(final_bdg)
+                    logger.info("Removed %s (bigwig created)", os.path.basename(final_bdg))
+                except Exception as e:
+                    logger.warning("bedGraph-to-bigWig conversion failed for %s: %s (keeping bdg)", os.path.basename(final_bdg), e)
         # else: bdg stays in tmpdir and is cleaned up automatically
 
 
