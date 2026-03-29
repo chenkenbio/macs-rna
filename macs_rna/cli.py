@@ -92,9 +92,10 @@ def get_callpeak_parser() -> argparse.ArgumentParser:
     )
     required_group.add_argument(
         "-f", "--format",
-        choices=("AUTO", "BAM", "BAMPE", "SAM", "BED", "BEDPE"),
+        choices=("AUTO", "BAM", "SAM", "BED", "BEDPE"),
         default=None, required=True,
-        help="Input file format",
+        help="Input file format (BAMPE is excluded: RNA-seq reads are spliced, "
+        "so paired-end data should use BAM with --nomodel --extsize)",
     )
     required_group.add_argument(
         "-g", "--gsize", default="hs",
