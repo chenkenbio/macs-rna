@@ -308,10 +308,19 @@ def _run_macs3_callpeak(
     dry_run : bool
         If True, print command without executing.
     """
+    # Convert strand-split BAM to BED — MACS3 >=3.0.3 silently drops PE reads
+    # with -f BAM when the BAM has paired flags (bit 1 set).
+    treatment_bed = treatment.replace(".bam", ".bed")
+    run_cmd(f"bedtools bamtobed -i {shlex.quote(treatment)} > {shlex.quote(treatment_bed)}", dry_run=dry_run)
+    control_bed = None
+    if control is not None:
+        control_bed = control.replace(".bam", ".bed")
+        run_cmd(f"bedtools bamtobed -i {shlex.quote(control)} > {shlex.quote(control_bed)}", dry_run=dry_run)
+
     cmd_parts = [
         args.macs_path, "callpeak",
-        f"-t {shlex.quote(treatment)}",
-        "-f BAM",  # strand-split output is always BAM
+        f"-t {shlex.quote(treatment_bed)}",
+        "-f BED",
         f"-g {args.gsize}",
         f"-n {shlex.quote(name)}",
         f"--outdir {shlex.quote(outdir)}",
@@ -324,8 +333,8 @@ def _run_macs3_callpeak(
     if args.SPMR:
         cmd_parts.append("--SPMR")
 
-    if control is not None:
-        cmd_parts.append(f"-c {shlex.quote(control)}")
+    if control_bed is not None:
+        cmd_parts.append(f"-c {shlex.quote(control_bed)}")
 
     # Fragment size handling
     if args.nomodel or extsize is not None:
