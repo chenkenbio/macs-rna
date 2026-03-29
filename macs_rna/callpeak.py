@@ -170,6 +170,10 @@ def _run_pipeline(
     extsize = args.extsize
     if not args.nomodel and extsize is None:
         logger.info("=== Step 3/5: Estimating fragment size from full BAM ===")
+        logger.info(
+            "Note: predictd runs on the full BAM (all reads, both strands). "
+            "Use --nomodel --extsize to specify fragment size explicitly."
+        )
         extsize = _estimate_fragment_size(args, dry_run)
 
     # --- Step 4: Per-strand peak calling ---
@@ -182,6 +186,13 @@ def _run_pipeline(
 
     peak_files = []
     for strand_name, strand_char, t_bam, c_bam in strand_configs:
+        strand_reads = strand_treat_counts[strand_name]
+        if not dry_run and strand_reads == 0:
+            logger.warning(
+                "Skipping %s strand: 0 treatment reads after filtering", strand_name,
+            )
+            continue
+
         logger.info("--- Processing %s strand ---", strand_name)
         strand_dir = os.path.join(tmpdir, strand_name)
         os.makedirs(strand_dir, exist_ok=True)
@@ -200,7 +211,6 @@ def _run_pipeline(
         )
 
         # 4b-4d. Re-score and call peaks with global scaling
-        strand_reads = strand_treat_counts[strand_name]
         peak_file = _rescale_and_call_peaks(
             strand_dir=strand_dir,
             strand_prefix=strand_prefix,
@@ -442,19 +452,19 @@ def _rescale_and_call_peaks(
         bdgcmp_ctrl = os.path.join(strand_dir, f"{strand_prefix}_ctrl_scaled.bdg")
 
         run_cmd(
-            f"{args.macs_path} bdgopt"
-            f" -i {treat_bdg}"
+            f"{shlex.quote(args.macs_path)} bdgopt"
+            f" -i {shlex.quote(treat_bdg)}"
             f" -m multiply"
             f" -p {scale_factor:.6f}"
-            f" -o {bdgcmp_treat}",
+            f" -o {shlex.quote(bdgcmp_treat)}",
             dry_run=dry_run,
         )
         run_cmd(
-            f"{args.macs_path} bdgopt"
-            f" -i {ctrl_bdg}"
+            f"{shlex.quote(args.macs_path)} bdgopt"
+            f" -i {shlex.quote(ctrl_bdg)}"
             f" -m multiply"
             f" -p {scale_factor:.6f}"
-            f" -o {bdgcmp_ctrl}",
+            f" -o {shlex.quote(bdgcmp_ctrl)}",
             dry_run=dry_run,
         )
         scaling_flag = ""  # default S=1.0
@@ -462,13 +472,13 @@ def _rescale_and_call_peaks(
     # Re-score with bdgcmp
     ppois_bdg = os.path.join(strand_dir, f"{strand_prefix}_ppois.bdg")
     bdgcmp_cmd = (
-        f"{args.macs_path} bdgcmp"
-        f" -t {bdgcmp_treat}"
-        f" -c {bdgcmp_ctrl}"
+        f"{shlex.quote(args.macs_path)} bdgcmp"
+        f" -t {shlex.quote(bdgcmp_treat)}"
+        f" -c {shlex.quote(bdgcmp_ctrl)}"
     )
     if scaling_flag:
         bdgcmp_cmd += f" {scaling_flag}"
-    bdgcmp_cmd += f" -m ppois -o {ppois_bdg}"
+    bdgcmp_cmd += f" -m ppois -o {shlex.quote(ppois_bdg)}"
     run_cmd(bdgcmp_cmd, dry_run=dry_run)
 
     # Determine score track and cutoff for peak calling
@@ -481,10 +491,10 @@ def _rescale_and_call_peaks(
         qval = args.qvalue if args.qvalue is not None else 0.05
         qvalue_bdg = os.path.join(strand_dir, f"{strand_prefix}_qvalue.bdg")
         run_cmd(
-            f"{args.macs_path} bdgopt"
-            f" -i {ppois_bdg}"
+            f"{shlex.quote(args.macs_path)} bdgopt"
+            f" -i {shlex.quote(ppois_bdg)}"
             f" -m p2q"
-            f" -o {qvalue_bdg}",
+            f" -o {shlex.quote(qvalue_bdg)}",
             dry_run=dry_run,
         )
         score_bdg = qvalue_bdg

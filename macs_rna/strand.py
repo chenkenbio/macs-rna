@@ -113,9 +113,13 @@ def split_bam_by_strand(
         parts = ["samtools", "view", "-b", f"-@ {n_jobs}", "-h"]
         if min_mapq > 0:
             parts.append(f"-q {min_mapq}")
+        # Always exclude unmapped (0x4) and supplementary (0x800).
+        # Supplementary alignments are chimeric fragments of the same
+        # read and inflate counts if included.
+        exclude_flags = 0x4 | 0x800  # 2052
         if primary:
-            # 2304 = 256 (secondary) + 2048 (supplementary)
-            parts.append("-F 2304")
+            exclude_flags |= 0x100  # also exclude secondary → 2308
+        parts.append(f"-F {exclude_flags}")
         # PE read selection: -f 64 (R1) or -f 128 (R2)
         if is_pe and read == "1":
             parts.append("-f 64")
