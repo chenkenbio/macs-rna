@@ -219,6 +219,7 @@ def _run_pipeline(
             total_treat_M=total_treat_M,
             strand_treat=strand_reads,
             use_spmr=use_spmr,
+            extsize=extsize,
             args=args,
             dry_run=dry_run,
         )
@@ -391,6 +392,7 @@ def _rescale_and_call_peaks(
     total_treat_M: float,
     strand_treat: int,
     use_spmr: bool,
+    extsize: int | None,
     args: argparse.Namespace,
     dry_run: bool,
 ) -> str:
@@ -511,10 +513,12 @@ def _rescale_and_call_peaks(
             f"-C {-math.log10(args.broad_cutoff):.4f}",
             f"-o {shlex.quote(peak_file)}",
         ]
-        if args.min_length is not None:
-            cmd_parts.append(f"-l {args.min_length}")
-        if args.max_gap is not None:
-            cmd_parts.append(f"-g {args.max_gap}")
+        min_len = args.min_length if args.min_length is not None else (extsize if extsize is not None else None)
+        max_gap = args.max_gap if args.max_gap is not None else (extsize if extsize is not None else None)
+        if min_len is not None:
+            cmd_parts.append(f"-l {min_len}")
+        if max_gap is not None:
+            cmd_parts.append(f"-g {max_gap}")
     else:
         peak_suffix = "narrowPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
@@ -524,10 +528,14 @@ def _rescale_and_call_peaks(
             f"-c {cutoff:.4f}",
             f"-o {shlex.quote(peak_file)}",
         ]
-        if args.min_length is not None:
-            cmd_parts.append(f"-l {args.min_length}")
-        if args.max_gap is not None:
-            cmd_parts.append(f"-g {args.max_gap}")
+        # Default min-length and max-gap to extsize if not explicitly set,
+        # since bdgpeakcall's own defaults (200/30) ignore the extsize we used
+        min_len = args.min_length if args.min_length is not None else (extsize if extsize is not None else None)
+        max_gap = args.max_gap if args.max_gap is not None else (extsize if extsize is not None else None)
+        if min_len is not None:
+            cmd_parts.append(f"-l {min_len}")
+        if max_gap is not None:
+            cmd_parts.append(f"-g {max_gap}")
 
     run_cmd(" ".join(cmd_parts), dry_run=dry_run)
     return peak_file
