@@ -21,7 +21,7 @@ dependencies = [
 macs-rna = "macs_rna.cli:main"
 
 [project.urls]
-Repository = "https://github.com/kenchenbio/macs-rna"
+Repository = "https://github.com/chenkenbio/macs-rna"
 
 # --- Build the bundled macs3-rs accelerator into the wheel ---
 [tool.hatch.build.targets.wheel.hooks.custom]
