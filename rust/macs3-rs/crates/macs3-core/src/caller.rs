@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 
+use rayon::prelude::*;
+
 use crate::peak_io::{BroadPeakIO, PeakIO};
 use crate::pileup::{max_over_two_pv_array, single_end_pileup, PosVal};
 use crate::prob::poisson_cdf;
@@ -246,25 +248,55 @@ impl CallerFromAlignments {
         chrom_pair_treat_ctrl(&treat_pv, &ctrl_pv)
     }
 
-    /// Build the p->q table by scanning every chromosome
-    /// (`__cal_pvalue_qvalue_table`). Accumulates `pscore -> total bp length`,
-    /// then applies the Benjamini-Hochberg conversion.
-    fn cal_pvalue_qvalue_table(&mut self) {
-        // pscore (as f32 bits) -> total bp length.
-        let mut pscore_stat: BTreeMap<u32, i64> = BTreeMap::new();
+    /// Per-chromosome pscore->length histogram from a precomputed pileup
+    /// (one chromosome's contribution to `__cal_pvalue_qvalue_table`).
+    fn chrom_pscore_histogram(ptc: &ChromPTC) -> BTreeMap<u32, i64> {
+        let mut stat: BTreeMap<u32, i64> = BTreeMap::new();
+        let mut pre_p: i64 = 0;
+        for j in 0..ptc.pos.len() {
+            let this_v = get_pscore(ptc.treat[j] as i32, ptc.ctrl[j]);
+            let this_l = ptc.pos[j] as i64 - pre_p;
+            *stat.entry(this_v.to_bits()).or_insert(0) += this_l;
+            pre_p = ptc.pos[j] as i64;
+        }
+        stat
+    }
+
+    /// **Phase A (parallel) + Phase B (serial).**
+    ///
+    /// Pile up every chromosome and compute its pscore->length histogram in
+    /// parallel (`rayon` `par_iter` over chromosomes), then serially merge the
+    /// per-chromosome histograms in sorted-chromosome order and build the global
+    /// p->q table (`__cal_pvalue_qvalue_table`). The cached per-chromosome
+    /// [`ChromPTC`] pileups are returned (indexed by the SORTED chromosome order)
+    /// so the scoring/segmentation phase can reuse them without re-piling up.
+    ///
+    /// Histogram counts are integer (order-independent), so the merge is
+    /// deterministic; it is kept serial in a fixed order to be safe.
+    fn pileup_all_and_build_pqtable(&mut self) -> Vec<ChromPTC> {
         let chroms = self.chromosomes.clone();
-        for chrom in &chroms {
-            let ptc = self.pileup_treat_ctrl_a_chromosome(chrom);
-            let mut pre_p: i64 = 0;
-            for j in 0..ptc.pos.len() {
-                let this_v = get_pscore(ptc.treat[j] as i32, ptc.ctrl[j]);
-                let this_l = ptc.pos[j] as i64 - pre_p;
-                *pscore_stat.entry(this_v.to_bits()).or_insert(0) += this_l;
-                pre_p = ptc.pos[j] as i64;
+
+        // Phase A: per-chrom independent pileup + histogram, in parallel.
+        // Collect into a Vec indexed by sorted chromosome order.
+        let per_chrom: Vec<(ChromPTC, BTreeMap<u32, i64>)> = chroms
+            .par_iter()
+            .map(|chrom| {
+                let ptc = self.pileup_treat_ctrl_a_chromosome(chrom);
+                let hist = Self::chrom_pscore_histogram(&ptc);
+                (ptc, hist)
+            })
+            .collect();
+
+        // Phase B: serial merge of integer histograms in fixed (sorted) order.
+        let mut pscore_stat: BTreeMap<u32, i64> = BTreeMap::new();
+        for (_ptc, hist) in &per_chrom {
+            for (&bits, &ln) in hist {
+                *pscore_stat.entry(bits).or_insert(0) += ln;
             }
         }
-
         self.pqtable = build_pq_table(&pscore_stat);
+
+        per_chrom.into_iter().map(|(ptc, _hist)| ptc).collect()
     }
 
     /// Call narrow peaks (`CallerFromAlignments.call_peaks`).
@@ -290,23 +322,44 @@ impl CallerFromAlignments {
         );
         let mut peaks = PeakIO::default();
 
-        if self.pqtable.is_empty() {
-            self.cal_pvalue_qvalue_table();
-        }
-
-        let mut bdg = self.open_bedgraph(treat_out, ctrl_out);
+        // Phase A (parallel) + Phase B (serial): pileups + global pq-table.
+        // Always rebuild here so we can reuse the cached pileups in Phase C.
+        let cached = self.pileup_all_and_build_pqtable();
 
         let chroms = self.chromosomes.clone();
-        for chrom in &chroms {
-            self.chrom_call_peak(
-                &mut peaks,
-                chrom,
-                scoring_methods,
-                scoring_cutoffs,
-                min_length,
-                max_gap,
-                bdg.as_mut(),
-            );
+        let want_bdg = self.save_bedgraph && treat_out.is_some() && ctrl_out.is_some();
+
+        // Phase C (parallel): per-chrom score / segment / format into buffers.
+        // Each chrom produces (its narrow peaks, treat-bdg bytes, ctrl-bdg bytes).
+        // No shared mutable state.
+        let results: Vec<ChromCallResult> = chroms
+            .par_iter()
+            .zip(cached.par_iter())
+            .map(|(chrom, ptc)| {
+                self.chrom_call_peak_buffered(
+                    chrom,
+                    ptc,
+                    scoring_methods,
+                    scoring_cutoffs,
+                    min_length,
+                    max_gap,
+                    want_bdg,
+                )
+            })
+            .collect();
+
+        // Phase D (serial, sorted-chrom order): write bedGraph bytes and collect
+        // peaks. Peak numbering is global and order-dependent, so this MUST be
+        // serial and identical to the previous (sorted-chrom) order.
+        let mut bdg = self.open_bedgraph(treat_out, ctrl_out);
+        for (chrom, res) in chroms.iter().zip(results.into_iter()) {
+            if let Some(w) = bdg.as_mut() {
+                let _ = w.treat.write_all(&res.treat_bdg);
+                let _ = w.ctrl.write_all(&res.ctrl_bdg);
+            }
+            for peak in res.peaks {
+                peaks.add_peak_content(chrom, peak);
+            }
         }
         peaks
     }
@@ -327,26 +380,44 @@ impl CallerFromAlignments {
         let mut lvl1peaks = PeakIO::default();
         let mut lvl2peaks = PeakIO::default();
 
-        if self.pqtable.is_empty() {
-            self.cal_pvalue_qvalue_table();
-        }
-
-        let mut bdg = self.open_bedgraph(treat_out, ctrl_out);
+        // Phase A (parallel) + Phase B (serial): pileups + global pq-table.
+        let cached = self.pileup_all_and_build_pqtable();
 
         let chroms = self.chromosomes.clone();
-        for chrom in &chroms {
-            self.chrom_call_broadpeak(
-                &mut lvl1peaks,
-                &mut lvl2peaks,
-                chrom,
-                scoring_methods,
-                lvl1_cutoffs,
-                lvl2_cutoffs,
-                min_length,
-                lvl1_max_gap,
-                lvl2_max_gap,
-                bdg.as_mut(),
-            );
+        let want_bdg = self.save_bedgraph && treat_out.is_some() && ctrl_out.is_some();
+
+        // Phase C (parallel): per-chrom segment (lvl1 + lvl2) + format bedGraph.
+        let results: Vec<ChromBroadResult> = chroms
+            .par_iter()
+            .zip(cached.par_iter())
+            .map(|(chrom, ptc)| {
+                self.chrom_call_broadpeak_buffered(
+                    chrom,
+                    ptc,
+                    scoring_methods,
+                    lvl1_cutoffs,
+                    lvl2_cutoffs,
+                    min_length,
+                    lvl1_max_gap,
+                    lvl2_max_gap,
+                    want_bdg,
+                )
+            })
+            .collect();
+
+        // Phase D (serial, sorted-chrom order): write bedGraph and collect peaks.
+        let mut bdg = self.open_bedgraph(treat_out, ctrl_out);
+        for (chrom, res) in chroms.iter().zip(results.into_iter()) {
+            if let Some(w) = bdg.as_mut() {
+                let _ = w.treat.write_all(&res.treat_bdg);
+                let _ = w.ctrl.write_all(&res.ctrl_bdg);
+            }
+            for peak in res.lvl1 {
+                lvl1peaks.add_peak_content(chrom, peak);
+            }
+            for peak in res.lvl2 {
+                lvl2peaks.add_peak_content(chrom, peak);
+            }
         }
 
         combine_broad(&lvl1peaks, &lvl2peaks)
@@ -411,13 +482,15 @@ impl CallerFromAlignments {
         s
     }
 
-    /// Write one chromosome's treat/control bedGraph
-    /// (`__write_bedGraph_for_a_chromosome`).
-    fn write_bedgraph_for_chrom<W: Write>(
+    /// Format one chromosome's treat/control bedGraph into two byte buffers
+    /// (`__write_bedGraph_for_a_chromosome`). Identical byte output to writing
+    /// directly; the caller flushes the buffers in sorted-chromosome order.
+    fn write_bedgraph_for_chrom(
         &self,
         chrom: &[u8],
         ptc: &ChromPTC,
-        w: &mut BedgraphWriters<W>,
+        treat_buf: &mut Vec<u8>,
+        ctrl_buf: &mut Vec<u8>,
     ) {
         let denominator: f32 = if self.save_spmr {
             if self.treat_scaling_factor == 1.0 {
@@ -445,42 +518,47 @@ impl CallerFromAlignments {
             let p = ptc.pos[i - 1];
 
             if (pre_v_t - v_t).abs() > 1e-5 {
-                write_bdg_line(w.treat, chrom, pre_p_t, p, pre_v_t);
+                write_bdg_line(treat_buf, chrom, pre_p_t, p, pre_v_t);
                 pre_v_t = v_t;
                 pre_p_t = p;
             }
             if (pre_v_c - v_c).abs() > 1e-5 {
-                write_bdg_line(w.ctrl, chrom, pre_p_c, p, pre_v_c);
+                write_bdg_line(ctrl_buf, chrom, pre_p_c, p, pre_v_c);
                 pre_v_c = v_c;
                 pre_p_c = p;
             }
         }
 
         let p = ptc.pos[l - 1];
-        write_bdg_line(w.treat, chrom, pre_p_t, p, pre_v_t);
-        write_bdg_line(w.ctrl, chrom, pre_p_c, p, pre_v_c);
+        write_bdg_line(treat_buf, chrom, pre_p_t, p, pre_v_t);
+        write_bdg_line(ctrl_buf, chrom, pre_p_c, p, pre_v_c);
     }
 
-    /// Call peaks for one chromosome (`__chrom_call_peak_using_certain_criteria`).
+    /// **Phase C (narrow):** call peaks for one chromosome from a precomputed
+    /// pileup (`__chrom_call_peak_using_certain_criteria`), returning the peaks
+    /// and the formatted bedGraph bytes. No shared mutable state — safe to run
+    /// in parallel across chromosomes.
     #[allow(clippy::too_many_arguments)]
-    fn chrom_call_peak<W: Write>(
+    fn chrom_call_peak_buffered(
         &self,
-        peaks: &mut PeakIO,
         chrom: &[u8],
+        ptc: &ChromPTC,
         scoring_methods: &[u8],
         scoring_cutoffs: &[f32],
         min_length: i32,
         max_gap: i32,
-        bdg: Option<&mut BedgraphWriters<W>>,
-    ) {
-        let ptc = self.pileup_treat_ctrl_a_chromosome(chrom);
-
-        if let Some(w) = bdg {
-            self.write_bedgraph_for_chrom(chrom, &ptc, w);
+        want_bdg: bool,
+    ) -> ChromCallResult {
+        let mut treat_bdg: Vec<u8> = Vec::new();
+        let mut ctrl_bdg: Vec<u8> = Vec::new();
+        if want_bdg {
+            self.write_bedgraph_for_chrom(chrom, ptc, &mut treat_bdg, &mut ctrl_bdg);
         }
 
+        let mut peaks: Vec<crate::peak_io::NarrowPeak> = Vec::new();
+
         let score_arrays: Vec<Vec<f32>> =
-            scoring_methods.iter().map(|&s| self.cal_score(&ptc, s)).collect();
+            scoring_methods.iter().map(|&s| self.cal_score(ptc, s)).collect();
 
         // above_cutoff: indices where ALL scores pass their cutoff (strict >).
         let n = ptc.pos.len();
@@ -491,7 +569,7 @@ impl CallerFromAlignments {
             }
         }
         if above.is_empty() {
-            return;
+            return ChromCallResult { peaks, treat_bdg, ctrl_bdg };
         }
 
         // peak_content: (start, end, treat_p, ctrl_p, index).
@@ -514,7 +592,7 @@ impl CallerFromAlignments {
             } else {
                 self.close_peak_wo_subpeaks(
                     &peak_content,
-                    peaks,
+                    &mut peaks,
                     min_length,
                     chrom,
                     &score_arrays,
@@ -528,21 +606,24 @@ impl CallerFromAlignments {
         if !peak_content.is_empty() {
             self.close_peak_wo_subpeaks(
                 &peak_content,
-                peaks,
+                &mut peaks,
                 min_length,
                 chrom,
                 &score_arrays,
                 scoring_cutoffs,
             );
         }
+
+        ChromCallResult { peaks, treat_bdg, ctrl_bdg }
     }
 
     /// Close one narrow peak (`__close_peak_wo_subpeaks`). Summit = midpoint of
-    /// the highest-treatment-pileup region; ties pick the middle one.
+    /// the highest-treatment-pileup region; ties pick the middle one. Appends to
+    /// the per-chromosome peak list (insertion order matches MACS's list append).
     fn close_peak_wo_subpeaks(
         &self,
         peak_content: &[(i32, i32, f32, f32, usize)],
-        peaks: &mut PeakIO,
+        peaks: &mut Vec<crate::peak_io::NarrowPeak>,
         min_length: i32,
         chrom: &[u8],
         score_arrays: &[Vec<f32>],
@@ -587,8 +668,8 @@ impl CallerFromAlignments {
         let summit_p_score = get_pscore(summit_treat as i32, summit_ctrl);
         let summit_q_score = *self.pqtable.get(&summit_p_score.to_bits()).unwrap_or(&0.0);
 
-        peaks.add(
-            chrom,
+        peaks.push(crate::peak_io::NarrowPeak::new(
+            chrom.to_vec(),
             peak_content[0].0,
             peak_content[peak_content.len() - 1].1,
             summit_pos,
@@ -597,58 +678,64 @@ impl CallerFromAlignments {
             summit_p_score,
             (summit_treat + self.pseudocount) / (summit_ctrl + self.pseudocount),
             summit_q_score,
-            b"",
-        );
+            b"".to_vec(),
+        ));
     }
 
-    /// Call broad peaks for one chromosome
-    /// (`__chrom_call_broadpeak_using_certain_criteria`).
+    /// **Phase C (broad):** call broad peaks for one chromosome from a
+    /// precomputed pileup (`__chrom_call_broadpeak_using_certain_criteria`),
+    /// returning the lvl1/lvl2 peaks and the formatted bedGraph bytes. No shared
+    /// mutable state — safe to run in parallel across chromosomes.
     #[allow(clippy::too_many_arguments)]
-    fn chrom_call_broadpeak<W: Write>(
+    fn chrom_call_broadpeak_buffered(
         &self,
-        lvl1peaks: &mut PeakIO,
-        lvl2peaks: &mut PeakIO,
         chrom: &[u8],
+        ptc: &ChromPTC,
         scoring_methods: &[u8],
         lvl1_cutoffs: &[f32],
         lvl2_cutoffs: &[f32],
         min_length: i32,
         lvl1_max_gap: i32,
         lvl2_max_gap: i32,
-        bdg: Option<&mut BedgraphWriters<W>>,
-    ) {
-        let ptc = self.pileup_treat_ctrl_a_chromosome(chrom);
-
-        if let Some(w) = bdg {
-            self.write_bedgraph_for_chrom(chrom, &ptc, w);
+        want_bdg: bool,
+    ) -> ChromBroadResult {
+        let mut treat_bdg: Vec<u8> = Vec::new();
+        let mut ctrl_bdg: Vec<u8> = Vec::new();
+        if want_bdg {
+            self.write_bedgraph_for_chrom(chrom, ptc, &mut treat_bdg, &mut ctrl_bdg);
         }
 
         let score_arrays: Vec<Vec<f32>> =
-            scoring_methods.iter().map(|&s| self.cal_score(&ptc, s)).collect();
+            scoring_methods.iter().map(|&s| self.cal_score(ptc, s)).collect();
+
+        let mut lvl1: Vec<crate::peak_io::NarrowPeak> = Vec::new();
+        let mut lvl2: Vec<crate::peak_io::NarrowPeak> = Vec::new();
 
         // lvl1: strong peaks.
         self.segment_broad(
-            &ptc,
+            ptc,
             &score_arrays,
             lvl1_cutoffs,
             lvl1_max_gap,
             min_length,
             chrom,
-            lvl1peaks,
+            &mut lvl1,
         );
         // lvl2: weak peaks.
         self.segment_broad(
-            &ptc,
+            ptc,
             &score_arrays,
             lvl2_cutoffs,
             lvl2_max_gap,
             min_length,
             chrom,
-            lvl2peaks,
+            &mut lvl2,
         );
+
+        ChromBroadResult { lvl1, lvl2, treat_bdg, ctrl_bdg }
     }
 
-    /// Segment one level of a broad peak call into `out`.
+    /// Segment one level of a broad peak call into `out` (appended in order).
     #[allow(clippy::too_many_arguments)]
     fn segment_broad(
         &self,
@@ -658,7 +745,7 @@ impl CallerFromAlignments {
         max_gap: i32,
         min_length: i32,
         chrom: &[u8],
-        out: &mut PeakIO,
+        out: &mut Vec<crate::peak_io::NarrowPeak>,
     ) {
         let n = ptc.pos.len();
         let mut above: Vec<usize> = Vec::new();
@@ -698,11 +785,12 @@ impl CallerFromAlignments {
     }
 
     /// Close one broad-region peak (`__close_peak_for_broad_region`). Scores are
-    /// the length-weighted mean over the region.
+    /// the length-weighted mean over the region. Appends to the per-chromosome
+    /// peak list (insertion order matches MACS's list append).
     fn close_peak_for_broad(
         &self,
         peak_content: &[(i32, i32, f32, f32, usize)],
-        peaks: &mut PeakIO,
+        peaks: &mut Vec<crate::peak_io::NarrowPeak>,
         min_length: i32,
         chrom: &[u8],
     ) {
@@ -734,8 +822,8 @@ impl CallerFromAlignments {
             .map(|(&t, &c)| (t + self.pseudocount) / (c + self.pseudocount))
             .collect();
 
-        peaks.add(
-            chrom,
+        peaks.push(crate::peak_io::NarrowPeak::new(
+            chrom.to_vec(),
             peak_content[0].0,
             peak_content[peak_content.len() - 1].1,
             0,
@@ -744,9 +832,26 @@ impl CallerFromAlignments {
             mean_from_value_length(&pscores, &lengths),
             mean_from_value_length(&fcs, &lengths),
             mean_from_value_length(&qscores, &lengths),
-            b"",
-        );
+            b"".to_vec(),
+        ));
     }
+}
+
+/// Phase-C result for one chromosome (narrow): the peaks (in insertion order)
+/// plus the formatted treat/control bedGraph bytes.
+struct ChromCallResult {
+    peaks: Vec<crate::peak_io::NarrowPeak>,
+    treat_bdg: Vec<u8>,
+    ctrl_bdg: Vec<u8>,
+}
+
+/// Phase-C result for one chromosome (broad): the lvl1/lvl2 peaks plus the
+/// formatted treat/control bedGraph bytes.
+struct ChromBroadResult {
+    lvl1: Vec<crate::peak_io::NarrowPeak>,
+    lvl2: Vec<crate::peak_io::NarrowPeak>,
+    treat_bdg: Vec<u8>,
+    ctrl_bdg: Vec<u8>,
 }
 
 /// Holds the two bedGraph output sinks during a call.
