@@ -16,6 +16,8 @@
 
 use std::collections::BTreeMap;
 
+use rayon::prelude::*;
+
 use crate::bedgraph::BedGraphTrack;
 use crate::peak_io::{BroadPeakIO, PeakIO};
 use crate::prob::poisson_cdf;
@@ -288,24 +290,44 @@ impl ScoreTrack2 {
 
     /// `compute_pvalue` (`ScoreTrack.py::compute_pvalue`): per-interval
     /// `-log10 p` Poisson score, accumulating `pvalue_stat[score] += length`.
+    ///
+    /// **Phase A (parallel):** each chromosome computes scores in place and
+    /// builds a local pscore->length histogram.
+    /// **Phase B (serial):** merge the per-chromosome histograms in fixed
+    /// BTreeMap (bytewise-sorted) order into `self.pvalue_stat`.
     fn compute_pvalue(&mut self) {
         let pseudocount = self.pseudocount;
-        // Split-borrow disjoint fields so the per-chrom loop and pvalue_stat
-        // updates don't alias `self`.
-        let data = &mut self.data;
-        let stat = &mut self.pvalue_stat;
-        for chrom in data.values_mut() {
-            let mut prev_pos: i64 = 0;
-            for i in 0..chrom.pos.len() {
-                // observed = cast(int, p[i] + pseudocount); expectation =
-                // c[i] + pseudocount (passed as f64 per the plan).
-                let observed = (chrom.treat[i] + pseudocount) as i32;
-                let expectation = (chrom.ctrl[i] + pseudocount) as f64;
-                let v = get_pscore(observed, expectation);
-                chrom.score[i] = v;
-                let tmp_l = chrom.pos[i] as i64 - prev_pos;
-                *stat.entry(v.to_bits()).or_insert(0) += tmp_l;
-                prev_pos = chrom.pos[i] as i64;
+
+        // Phase A: parallel per-chrom score computation.
+        // Collect &mut ChromScore refs in BTreeMap order first, then hand them
+        // to rayon; the collect() call consumes every ref before Phase B
+        // touches self.pvalue_stat (no aliasing).
+        let hists: Vec<BTreeMap<u32, i64>> = {
+            self.data
+                .values_mut()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|chrom| {
+                    let mut local_hist: BTreeMap<u32, i64> = BTreeMap::new();
+                    let mut prev_pos: i64 = 0;
+                    for i in 0..chrom.pos.len() {
+                        let observed = (chrom.treat[i] + pseudocount) as i32;
+                        let expectation = (chrom.ctrl[i] + pseudocount) as f64;
+                        let v = get_pscore(observed, expectation);
+                        chrom.score[i] = v;
+                        let tmp_l = chrom.pos[i] as i64 - prev_pos;
+                        *local_hist.entry(v.to_bits()).or_insert(0) += tmp_l;
+                        prev_pos = chrom.pos[i] as i64;
+                    }
+                    local_hist
+                })
+                .collect()
+        }; // all &mut ChromScore refs dropped here; self.data borrow released
+
+        // Phase B: serial merge in fixed (BTreeMap sorted-chrom) order.
+        for hist in hists {
+            for (bits, ln) in hist {
+                *self.pvalue_stat.entry(bits).or_insert(0) += ln;
             }
         }
         self.scoring_method = b'p';
@@ -313,15 +335,23 @@ impl ScoreTrack2 {
 
     /// `compute_qvalue` (`ScoreTrack.py::compute_qvalue`): convert each pscore to
     /// its qscore via the p->q table. Requires p-values computed first.
+    ///
+    /// `make_pq_table` stays serial (reads the global `pvalue_stat`). The
+    /// per-chrom score transform is parallel: each chrom reads the shared
+    /// (immutable) pqtable and writes its own score vec.
     fn compute_qvalue(&mut self) {
         debug_assert_eq!(self.scoring_method, b'p');
         let pqtable = self.make_pq_table();
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                let key = chrom.score[i].to_bits();
-                chrom.score[i] = *pqtable.get(&key).expect("pscore present in pq table");
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    let key = chrom.score[i].to_bits();
+                    chrom.score[i] = *pqtable.get(&key).expect("pscore present in pq table");
+                }
+            });
         self.scoring_method = b'q';
     }
 
@@ -329,22 +359,32 @@ impl ScoreTrack2 {
     /// logLR of treatment vs control with the pseudocount added.
     fn compute_likelihood(&mut self) {
         let pseudocount = self.pseudocount;
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                chrom.score[i] = log_lr_asym(chrom.treat[i] + pseudocount, chrom.ctrl[i] + pseudocount);
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    chrom.score[i] =
+                        log_lr_asym(chrom.treat[i] + pseudocount, chrom.ctrl[i] + pseudocount);
+                }
+            });
         self.scoring_method = b'l';
     }
 
     /// `compute_sym_likelihood` (`ScoreTrack.py::compute_sym_likelihood`).
     fn compute_sym_likelihood(&mut self) {
         let pseudocount = self.pseudocount;
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                chrom.score[i] = log_lr_sym(chrom.treat[i] + pseudocount, chrom.ctrl[i] + pseudocount);
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    chrom.score[i] =
+                        log_lr_sym(chrom.treat[i] + pseudocount, chrom.ctrl[i] + pseudocount);
+                }
+            });
         self.scoring_method = b's';
     }
 
@@ -353,13 +393,17 @@ impl ScoreTrack2 {
     /// is f32 and `log10` returns `double`, narrowed to the f32 score slot.
     fn compute_logfe(&mut self) {
         let pseudocount = self.pseudocount;
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                let x = chrom.treat[i] + pseudocount;
-                let y = chrom.ctrl[i] + pseudocount;
-                chrom.score[i] = (x / y).log10();
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    let x = chrom.treat[i] + pseudocount;
+                    let y = chrom.ctrl[i] + pseudocount;
+                    chrom.score[i] = (x / y).log10();
+                }
+            });
         self.scoring_method = b'f';
     }
 
@@ -367,21 +411,30 @@ impl ScoreTrack2 {
     /// linear `(p+pc)/(c+pc)`, all f32.
     fn compute_foldenrichment(&mut self) {
         let pseudocount = self.pseudocount;
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                chrom.score[i] = (chrom.treat[i] + pseudocount) / (chrom.ctrl[i] + pseudocount);
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    chrom.score[i] =
+                        (chrom.treat[i] + pseudocount) / (chrom.ctrl[i] + pseudocount);
+                }
+            });
         self.scoring_method = b'F';
     }
 
     /// `compute_subtraction` (`ScoreTrack.py::compute_subtraction`): `p - c`.
     fn compute_subtraction(&mut self) {
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                chrom.score[i] = chrom.treat[i] - chrom.ctrl[i];
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    chrom.score[i] = chrom.treat[i] - chrom.ctrl[i];
+                }
+            });
         self.scoring_method = b'd';
     }
 
@@ -394,36 +447,48 @@ impl ScoreTrack2 {
             b'M' => 1.0,
             _ => self.treat_edm,
         };
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                chrom.score[i] = chrom.treat[i] / scale;
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    chrom.score[i] = chrom.treat[i] / scale;
+                }
+            });
         self.scoring_method = b'm';
     }
 
     /// `compute_max` (`ScoreTrack.py::compute_max`): element-wise max of
     /// treatment and control pileups.
     fn compute_max(&mut self) {
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.score.len() {
-                let p = chrom.treat[i];
-                let c = chrom.ctrl[i];
-                // Python's max(p, c) returns the first arg on ties (p == c).
-                chrom.score[i] = if c > p { c } else { p };
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.score.len() {
+                    let p = chrom.treat[i];
+                    let c = chrom.ctrl[i];
+                    // Python's max(p, c) returns the first arg on ties (p == c).
+                    chrom.score[i] = if c > p { c } else { p };
+                }
+            });
         self.scoring_method = b'M';
     }
 
     /// Scale treatment and control pileups in place (`ScoreTrack.py::normalize`).
     fn normalize(&mut self, treat_scale: f32, control_scale: f32) {
-        for chrom in self.data.values_mut() {
-            for i in 0..chrom.pos.len() {
-                chrom.treat[i] *= treat_scale;
-                chrom.ctrl[i] *= control_scale;
-            }
-        }
+        self.data
+            .values_mut()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|chrom| {
+                for i in 0..chrom.pos.len() {
+                    chrom.treat[i] *= treat_scale;
+                    chrom.ctrl[i] *= control_scale;
+                }
+            });
     }
 
     /// Change normalization method (`change_normalization_method`). Dispatches
@@ -680,10 +745,10 @@ impl ScoreTrack2 {
     /// Write column `column` (1=chip, 2=control, 3=score) as bedGraph using the
     /// `>1e-5` break predicate (`ScoreTrack.py::write_bedGraph`).
     ///
-    /// Emits the optional UCSC track line when `self.trackline` is set, then for
-    /// each chromosome (bytewise-sorted) walks the selected column with
-    /// [`crate::bedgraph_io::Gt1e5`] coalescing via
-    /// [`crate::bedgraph_io::write_bedgraph_predicate`].
+    /// **Phase A (parallel):** each chromosome formats its data into a private
+    /// `Vec<u8>` buffer. **Phase B (serial):** emits the optional UCSC track
+    /// line first, then writes the per-chromosome buffers in bytewise-sorted
+    /// (BTreeMap) order — preserving byte-identical output.
     pub fn write_bedgraph<W: std::io::Write>(
         &self,
         fhd: &mut W,
@@ -693,6 +758,31 @@ impl ScoreTrack2 {
     ) -> std::io::Result<()> {
         assert!((1..=3).contains(&column), "column should be between 1, 2 or 3.");
 
+        // Phase A (parallel): format each chromosome into a private byte buffer.
+        // Collect (chrom, c) pairs in BTreeMap (bytewise-sorted) order first.
+        let pairs: Vec<(&Vec<u8>, &ChromScore)> = self.data.iter().collect();
+        let buffers: Vec<Vec<u8>> = pairs
+            .into_par_iter()
+            .map(|(chrom, c)| {
+                let value: &[f32] = match column {
+                    1 => &c.treat,
+                    2 => &c.ctrl,
+                    _ => &c.score,
+                };
+                let mut buf: Vec<u8> = Vec::new();
+                crate::bedgraph_io::write_bedgraph_predicate(
+                    chrom,
+                    &c.pos,
+                    value,
+                    &crate::bedgraph_io::Gt1e5,
+                    &mut buf,
+                )
+                .expect("write to Vec<u8> cannot fail");
+                buf
+            })
+            .collect();
+
+        // Phase B (serial): optional track line then chromosomes in sorted order.
         if self.trackline {
             // MACS writes: track type=bedGraph name="%s" description="%s"\n
             // with the raw (un-escaped) name/description here.
@@ -701,20 +791,8 @@ impl ScoreTrack2 {
                 "track type=bedGraph name=\"{name}\" description=\"{description}\"\n"
             )?;
         }
-
-        for (chrom, c) in &self.data {
-            let value: &[f32] = match column {
-                1 => &c.treat,
-                2 => &c.ctrl,
-                _ => &c.score,
-            };
-            crate::bedgraph_io::write_bedgraph_predicate(
-                chrom,
-                &c.pos,
-                value,
-                &crate::bedgraph_io::Gt1e5,
-                fhd,
-            )?;
+        for buf in buffers {
+            fhd.write_all(&buf)?;
         }
         Ok(())
     }
