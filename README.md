@@ -34,7 +34,31 @@ When `--SPMR` is passed, the scaling is done via `bdgcmp -S {total_reads_in_mill
 pip install -e .
 ```
 
-Requires `macs3>=3.0.0`, `samtools`, and optionally `bedGraphToBigWig` (for bigwig conversion).
+Requires `macs3>=3.0.4`, `samtools`, and optionally `bedGraphToBigWig` (for bigwig conversion). A [Rust toolchain](https://rustup.rs) (`cargo`) is optional — only needed to (re)build the bundled accelerator from source (see below).
+
+## Acceleration (Rust backend)
+
+`macs-rna` ships with **`macs3-rs`**, a Rust reimplementation of the MACS3 hot paths it shells out to (`callpeak`, `pileup`, `bdgcmp`, `bdgopt`, `bdgpeakcall`, `bdgbroadcall`, `predictd`). It is a **byte-identical drop-in** for macs3 3.0.4 — identical output, just faster via per-chromosome multi-threading (rayon). On a 24-chromosome run at 8 threads: `bdgcmp` ~3×, `pileup` ~2×, `callpeak` ~7× vs stock macs3 3.0.4.
+
+**Backend selection** (`--backend`, default `auto`):
+
+| value | behavior |
+|-------|----------|
+| `auto` *(default)* | use `macs3-rs` where supported, fall back to stock macs3 otherwise |
+| `rust` | prefer `macs3-rs` (still falls back per-subcommand for unsupported flags) |
+| `macs3` | always use stock macs3 |
+
+`auto` is downgraded to `macs3` automatically when `--macs-path` points at a custom executable. Individual subcommands transparently fall back to stock macs3 when a flag `macs3-rs` does not implement is used (e.g. `--call-summits`, `--cutoff-analysis`).
+
+**Getting the binary.** A pre-built `macs3-rs` ships in the installed wheel. To (re)build from source (needs `cargo`):
+
+```bash
+macs-rna build-accel    # cargo build --release  ->  macs_rna/_accel/macs3-rs
+```
+
+`macs-rna` locates the binary in order: `$MACS_RNA_ACCEL` (explicit path) → packaged `macs_rna/_accel/macs3-rs` → source build `rust/macs3-rs/target/release/macs3-rs` → `macs3-rs` on `$PATH`. Set `MACS_RNA_NO_ACCEL=1` to disable the accelerator and force stock macs3.
+
+**Threads.** When run through `macs-rna`, `macs3-rs` chooses its thread count from `RAYON_NUM_THREADS` → `SLURM_CPUS_ON_NODE` → `min(8, nproc)` — a considerate default on shared/cluster nodes. Set `RAYON_NUM_THREADS=N` to cap it. (This is separate from `macs-rna --n-jobs`, which controls samtools threads during strand splitting.) The standalone binary also accepts a global `-T/--threads N`.
 
 ## Usage
 
@@ -69,6 +93,8 @@ macs-rna callpeak \
 | `--min-mapq` | Minimum mapping quality for strand split (default: 0) |
 | `--primary` | Only keep primary alignments |
 | `--mode {m6A-MeRIP,seCLIP}` | Preset recipe for common experiment types |
+| `--backend {auto,rust,macs3}` | Peak-calling engine (default: `auto`); see [Acceleration](#acceleration-rust-backend) |
+| `--n-jobs` | samtools threads during strand split (default: 8) |
 | `--dry-run` | Print all commands without executing |
 
 Most `macs3 callpeak` arguments (`-t`, `-c`, `-f`, `-g`, `--keep-dup`, `--nomodel`, `--extsize`, `-q`/`-p`, `--broad`, etc.) are supported. Notable differences from macs3:
