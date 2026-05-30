@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/macs3-core",
+    "crates/macs3-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+authors = ["Ken Chen <chenkenbio@gmail.com>"]
+description = "Fast Rust reimplementation of MACS3 hot paths (drop-in for macs3 3.0.4)"
+
+# Release profile tuned for numeric throughput. We keep codegen deterministic;
+# do NOT enable fast-math style flags anywhere — bit-exactness with MACS3 (which
+# uses strict IEEE f32/f64 arithmetic) depends on standard rounding behaviour.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

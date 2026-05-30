@@ -21,10 +21,31 @@ import shutil
 import tempfile
 from typing import Optional
 
+from macs_rna.backend import resolve_backend
 from macs_rna.strand import split_bam_by_strand
 from macs_rna.utils import bdg_to_bigwig, count_reads, resolve_chromsizes, run_cmd
 
 logger = logging.getLogger("macs_rna")
+
+
+def _backend_label(exe: str, macs_path: str) -> str:
+    """Human-readable backend label for logging.
+
+    Parameters
+    ----------
+    exe : str
+        Resolved executable path returned by ``resolve_backend``.
+    macs_path : str
+        The stock macs3 path used as fallback.
+
+    Returns
+    -------
+    str
+        ``"rust (<path>)"`` if the Rust accelerator was chosen, else
+        ``"macs3 (<path>)"``.
+    """
+    engine = "macs3" if exe == macs_path else "rust"
+    return f"{engine} ({exe})"
 
 
 def run_callpeak(args: argparse.Namespace) -> None:
@@ -256,8 +277,13 @@ def _estimate_fragment_size(args: argparse.Namespace, dry_run: bool) -> Optional
     int or None
         Predicted fragment size, or None if dry_run.
     """
+    exe = resolve_backend(
+        "predictd", ["-i", "-f", "-g"],
+        prefer=args.backend, macs_path=args.macs_path,
+    )
+    logger.info("predictd backend: %s", _backend_label(exe, args.macs_path))
     cmd = (
-        f"{shlex.quote(args.macs_path)} predictd"
+        f"{shlex.quote(exe)} predictd"
         f" -i {shlex.quote(args.treatment)}"
         f" -f {args.format}"
         f" -g {args.gsize}"
@@ -329,7 +355,7 @@ def _run_macs3_callpeak(
         run_cmd(f"bedtools bamtobed -i {shlex.quote(control)} > {shlex.quote(control_bed)}", dry_run=dry_run)
 
     cmd_parts = [
-        shlex.quote(args.macs_path), "callpeak",
+        "callpeak",
         f"-t {shlex.quote(treatment_bed)}",
         "-f BED",
         f"-g {args.gsize}",
@@ -339,48 +365,68 @@ def _run_macs3_callpeak(
         f"--scale-to {args.scale_to}",
         "-B",  # always generate bedGraphs for re-scoring
     ]
+    flags = ["-t", "-f", "-g", "-n", "--outdir", "--keep-dup", "--scale-to", "-B"]
 
     # Only add --SPMR if user explicitly requested it
     if args.SPMR:
         cmd_parts.append("--SPMR")
+        flags.append("--SPMR")
 
     if control_bed is not None:
         cmd_parts.append(f"-c {shlex.quote(control_bed)}")
+        flags.append("-c")
 
     # Fragment size handling
     if args.nomodel or extsize is not None:
         cmd_parts.append("--nomodel")
+        flags.append("--nomodel")
         if extsize is not None:
             cmd_parts.append(f"--extsize {extsize}")
+            flags.append("--extsize")
         elif args.extsize is not None:
             cmd_parts.append(f"--extsize {args.extsize}")
+            flags.append("--extsize")
     if args.shift is not None:
         cmd_parts.append(f"--shift {args.shift}")
+        flags.append("--shift")
 
     # Cutoff — macs3 callpeak still needs one for its internal run
     if args.pvalue is not None:
         cmd_parts.append(f"-p {args.pvalue}")
+        flags.append("-p")
     else:
         qval = args.qvalue if args.qvalue is not None else 0.05
         cmd_parts.append(f"-q {qval}")
+        flags.append("-q")
 
     # Optional args
     if args.nolambda:
         cmd_parts.append("--nolambda")
+        flags.append("--nolambda")
     if args.slocal is not None:
         cmd_parts.append(f"--slocal {args.slocal}")
+        flags.append("--slocal")
     if args.llocal is not None:
         cmd_parts.append(f"--llocal {args.llocal}")
+        flags.append("--llocal")
     if args.max_gap is not None:
         cmd_parts.append(f"--max-gap {args.max_gap}")
+        flags.append("--max-gap")
     if args.broad:
         cmd_parts.append("--broad")
+        flags.append("--broad")
     if args.fe_cutoff is not None:
         cmd_parts.append(f"--fe-cutoff {args.fe_cutoff}")
+        flags.append("--fe-cutoff")
     if args.buffer_size is not None:
         cmd_parts.append(f"--buffer-size {args.buffer_size}")
+        flags.append("--buffer-size")
 
-    cmd = " ".join(cmd_parts)
+    exe = resolve_backend(
+        "callpeak", flags, prefer=args.backend, macs_path=args.macs_path,
+    )
+    logger.info("callpeak backend: %s", _backend_label(exe, args.macs_path))
+    cmd = " ".join([shlex.quote(exe)] + cmd_parts)
     run_cmd(cmd, dry_run=dry_run)
 
 
@@ -453,8 +499,13 @@ def _rescale_and_call_peaks(
         bdgcmp_treat = os.path.join(strand_dir, f"{strand_prefix}_treat_scaled.bdg")
         bdgcmp_ctrl = os.path.join(strand_dir, f"{strand_prefix}_ctrl_scaled.bdg")
 
+        bdgopt_exe = resolve_backend(
+            "bdgopt", ["-i", "-m", "-p", "-o"],
+            prefer=args.backend, macs_path=args.macs_path,
+        )
+        logger.info("bdgopt (multiply) backend: %s", _backend_label(bdgopt_exe, args.macs_path))
         run_cmd(
-            f"{shlex.quote(args.macs_path)} bdgopt"
+            f"{shlex.quote(bdgopt_exe)} bdgopt"
             f" -i {shlex.quote(treat_bdg)}"
             f" -m multiply"
             f" -p {scale_factor:.6f}"
@@ -462,7 +513,7 @@ def _rescale_and_call_peaks(
             dry_run=dry_run,
         )
         run_cmd(
-            f"{shlex.quote(args.macs_path)} bdgopt"
+            f"{shlex.quote(bdgopt_exe)} bdgopt"
             f" -i {shlex.quote(ctrl_bdg)}"
             f" -m multiply"
             f" -p {scale_factor:.6f}"
@@ -473,8 +524,15 @@ def _rescale_and_call_peaks(
 
     # Re-score with bdgcmp
     ppois_bdg = os.path.join(strand_dir, f"{strand_prefix}_ppois.bdg")
+    bdgcmp_flags = ["-t", "-c", "-m", "-o"]
+    if scaling_flag:
+        bdgcmp_flags.append("-S")
+    bdgcmp_exe = resolve_backend(
+        "bdgcmp", bdgcmp_flags, prefer=args.backend, macs_path=args.macs_path,
+    )
+    logger.info("bdgcmp backend: %s", _backend_label(bdgcmp_exe, args.macs_path))
     bdgcmp_cmd = (
-        f"{shlex.quote(args.macs_path)} bdgcmp"
+        f"{shlex.quote(bdgcmp_exe)} bdgcmp"
         f" -t {shlex.quote(bdgcmp_treat)}"
         f" -c {shlex.quote(bdgcmp_ctrl)}"
     )
@@ -492,8 +550,13 @@ def _rescale_and_call_peaks(
         # Convert to q-values for FDR cutoff
         qval = args.qvalue if args.qvalue is not None else 0.05
         qvalue_bdg = os.path.join(strand_dir, f"{strand_prefix}_qvalue.bdg")
+        p2q_exe = resolve_backend(
+            "bdgopt", ["-i", "-m", "-o"],
+            prefer=args.backend, macs_path=args.macs_path,
+        )
+        logger.info("bdgopt (p2q) backend: %s", _backend_label(p2q_exe, args.macs_path))
         run_cmd(
-            f"{shlex.quote(args.macs_path)} bdgopt"
+            f"{shlex.quote(p2q_exe)} bdgopt"
             f" -i {shlex.quote(ppois_bdg)}"
             f" -m p2q"
             f" -o {shlex.quote(qvalue_bdg)}",
@@ -506,38 +569,48 @@ def _rescale_and_call_peaks(
     if args.broad:
         peak_suffix = "broadPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
+        subcmd = "bdgbroadcall"
         cmd_parts = [
-            f"{shlex.quote(args.macs_path)} bdgbroadcall",
             f"-i {shlex.quote(score_bdg)}",
             f"-c {cutoff:.4f}",
             f"-C {-math.log10(args.broad_cutoff):.4f}",
             f"-o {shlex.quote(peak_file)}",
         ]
+        peak_flags = ["-i", "-c", "-C", "-o"]
         min_len = args.min_length if args.min_length is not None else (extsize if extsize is not None else None)
         max_gap = args.max_gap if args.max_gap is not None else (extsize if extsize is not None else None)
         if min_len is not None:
             cmd_parts.append(f"-l {min_len}")
+            peak_flags.append("-l")
         if max_gap is not None:
             cmd_parts.append(f"-g {max_gap}")
+            peak_flags.append("-g")
     else:
         peak_suffix = "narrowPeak"
         peak_file = os.path.join(outdir, f"{strand_prefix}_peaks.{peak_suffix}")
+        subcmd = "bdgpeakcall"
         cmd_parts = [
-            f"{shlex.quote(args.macs_path)} bdgpeakcall",
             f"-i {shlex.quote(score_bdg)}",
             f"-c {cutoff:.4f}",
             f"-o {shlex.quote(peak_file)}",
         ]
+        peak_flags = ["-i", "-c", "-o"]
         # Default min-length and max-gap to extsize if not explicitly set,
         # since bdgpeakcall's own defaults (200/30) ignore the extsize we used
         min_len = args.min_length if args.min_length is not None else (extsize if extsize is not None else None)
         max_gap = args.max_gap if args.max_gap is not None else (extsize if extsize is not None else None)
         if min_len is not None:
             cmd_parts.append(f"-l {min_len}")
+            peak_flags.append("-l")
         if max_gap is not None:
             cmd_parts.append(f"-g {max_gap}")
+            peak_flags.append("-g")
 
-    run_cmd(" ".join(cmd_parts), dry_run=dry_run)
+    peak_exe = resolve_backend(
+        subcmd, peak_flags, prefer=args.backend, macs_path=args.macs_path,
+    )
+    logger.info("%s backend: %s", subcmd, _backend_label(peak_exe, args.macs_path))
+    run_cmd(" ".join([f"{shlex.quote(peak_exe)} {subcmd}"] + cmd_parts), dry_run=dry_run)
     return peak_file
 
 

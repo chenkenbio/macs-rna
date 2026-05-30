@@ -71,8 +71,14 @@ def get_callpeak_parser() -> argparse.ArgumentParser:
         help="Preset recipe to override defaults",
     )
     strand_group.add_argument(
+        "--backend", choices=("rust", "macs3", "auto"), default="auto",
+        help="Which peak-calling engine to use: 'rust' (bundled macs3-rs), "
+        "'macs3' (stock), or 'auto' (rust where supported, else macs3).",
+    )
+    strand_group.add_argument(
         "--macs-path", default="macs3",
-        help="Path to MACS3 executable",
+        help="Path to stock MACS3 executable (used as fallback, or forced by "
+        "--backend macs3)",
     )
     strand_group.add_argument(
         "--dry-run", action="store_true",
@@ -217,15 +223,48 @@ def main() -> None:
         help="Strand-specific peak calling",
     )
 
+    # Register build-accel subcommand (build the macs3-rs accelerator binary)
+    subparsers.add_parser(
+        "build-accel",
+        help="Build the bundled macs3-rs accelerator and install it into the "
+        "package",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
+    if args.command == "build-accel":
+        from macs_rna.build_accel import build_accel
+        from macs_rna.utils import setup_logging
+
+        setup_logging(2)
+        sys.exit(build_accel())
+
     if args.command == "callpeak":
+        _resolve_backend_preference(args)
         _apply_recipe(args)
         run_callpeak(args)
+
+
+def _resolve_backend_preference(args: argparse.Namespace) -> None:
+    """Reconcile --backend and --macs-path into a final backend preference.
+
+    A user who points --macs-path at a custom executable but leaves --backend
+    at its default ('auto') clearly wants that stock macs3 honored, so we treat
+    a non-default --macs-path as an implicit '--backend macs3'. An explicit
+    '--backend rust' still wins (rust where supported, custom macs-path used
+    only for fallback).
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments. ``args.backend`` may be modified in place.
+    """
+    if args.backend == "auto" and args.macs_path != "macs3":
+        args.backend = "macs3"
 
 
 def _apply_recipe(args: argparse.Namespace) -> None:

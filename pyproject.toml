@@ -13,7 +13,7 @@ authors = [
     { name = "Ken Chen", email = "chenkenbio@gmail.com" },
 ]
 dependencies = [
-    "macs3>=3.0.0",
+    "macs3>=3.0.4",
     "pyyaml",
 ]
 
@@ -22,3 +22,15 @@ macs-rna = "macs_rna.cli:main"
 
 [project.urls]
 Repository = "https://github.com/kenchenbio/macs-rna"
+
+# --- Build the bundled macs3-rs accelerator into the wheel ---
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+# Include any pre-built accelerator binary in the source tree (e.g. from
+# `macs-rna build-accel`); the build hook also force-includes a freshly built
+# binary. Listed as an artifact so it ships even when _accel/ is gitignored.
+artifacts = [
+    "macs_rna/_accel/macs3-rs",
+]

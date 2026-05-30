@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Reference source checkout used as a porting spec (large nested MACS git tree)
+references/
+
+# Rust: build artifacts are covered by the generic target/ rule above.
+# Cargo.lock is intentionally NOT ignored (macs3-rs ships a binary -> pin deps).
+
+# Bundled accelerator binary (built by `macs-rna build-accel` / wheel build hook)
+macs_rna/_accel/

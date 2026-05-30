@@ -1,0 +1,17 @@
+[package]
+name = "macs3-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "macs3-rs command line interface"
+
+[[bin]]
+name = "macs3-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+macs3-core = { path = "../macs3-core" }
+# clap (derive), anyhow added via `cargo add` in the foundation phase.

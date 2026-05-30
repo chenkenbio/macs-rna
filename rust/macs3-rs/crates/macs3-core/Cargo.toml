@@ -1,0 +1,24 @@
+[package]
+name = "macs3-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core numeric/IO library reimplementing MACS3 signal processing"
+
+# External dependencies are added with `cargo add` by the foundation phase so
+# that real, resolvable versions are pinned (avoids hand-guessing version
+# numbers). Expected set: rayon, flate2, memchr, noodles-bam/sam/bgzf/core,
+# thiserror. Do NOT add deps from parallel fan-out agents — only the foundation
+# phase mutates this manifest.
+[dependencies]
+flate2 = "1.1.9"
+memchr = "2.8.1"
+noodles-bam = "0.88.0"
+noodles-bgzf = "0.46.0"
+noodles-core = "0.19.0"
+noodles-sam = "0.84.0"
+rayon = "1.12.0"
+thiserror = "2.0.18"
+
+[dev-dependencies]
