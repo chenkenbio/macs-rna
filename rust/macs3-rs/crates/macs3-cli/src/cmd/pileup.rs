@@ -8,6 +8,8 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
+
+use rayon::prelude::*;
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -122,26 +124,41 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
         .with_context(|| format!("failed to create output file {outfile}"))?;
     let mut out = BufWriter::new(file);
 
-    for chrom in &chrom_order {
-        let Some(loc) = treat.get_locations_by_chr(chrom) else {
-            continue;
-        };
-        let rlength = rlengths.get(chrom).copied().unwrap_or(macs3_core::track_fw::INT_MAX);
-        let pv = single_end_pileup(
-            &loc.plus,
-            &loc.minus,
-            five_shift,
-            three_shift,
-            0,
-            rlength,
-            1.0,
-            0.0,
-        );
-        // `append` is irrelevant here: we hold a single handle and write each
-        // chromosome's bytes sequentially, equivalent to the C append-per-chrom.
-        write_pv_exact(chrom, &pv, &mut out, true)?;
-    }
+    // Parallel phase: pile up each chromosome independently and format into a
+    // per-chrom byte buffer. par_iter() over chrom_order preserves insertion
+    // order in the collected Vec, so the write order below matches serial.
+    // treat is read-only here (get_locations_by_chr / get_rlengths), so &treat
+    // shares safely across rayon threads.
+    let buffers: Vec<Vec<u8>> = chrom_order
+        .par_iter()
+        .map(|chrom| {
+            let Some(loc) = treat.get_locations_by_chr(chrom) else {
+                return Vec::new();
+            };
+            let rlength = rlengths
+                .get(chrom)
+                .copied()
+                .unwrap_or(macs3_core::track_fw::INT_MAX);
+            let pv = single_end_pileup(
+                &loc.plus,
+                &loc.minus,
+                five_shift,
+                three_shift,
+                0,
+                rlength,
+                1.0,
+                0.0,
+            );
+            let mut buf: Vec<u8> = Vec::new();
+            let _ = write_pv_exact(chrom, &pv, &mut buf, true);
+            buf
+        })
+        .collect();
 
+    // Serial phase: write buffers in chrom_order (insertion) order.
+    for buf in &buffers {
+        out.write_all(buf)?;
+    }
     out.flush()?;
     Ok(())
 }

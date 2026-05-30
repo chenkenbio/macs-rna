@@ -305,6 +305,7 @@ dependencies = [
  "anyhow",
  "clap",
  "macs3-core",
+ "rayon",
 ]
 
 [[package]]
