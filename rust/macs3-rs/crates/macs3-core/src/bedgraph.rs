@@ -160,7 +160,8 @@ impl BedGraphTrack {
                 self.minvalue = minv;
             }
         }
-        self.data.insert(chromosome.to_vec(), ChromData { pos, val });
+        self.data
+            .insert(chromosome.to_vec(), ChromData { pos, val });
     }
 
     /// Return all chromosome names, **bytewise-sorted**
@@ -496,10 +497,14 @@ impl BedGraphTrack {
         let mut broadpeaks = crate::peak_io::BroadPeakIO::new();
         // Iterate chromosomes from lvl1_peaks in bytewise-sorted order.
         for chrom in lvl1_peaks.get_chr_names() {
-            let lvl1chrom: &[crate::peak_io::NarrowPeak] =
-                lvl1_peaks.peaks_by_chr(chrom).map(|v| v.as_slice()).unwrap_or(&[]);
-            let lvl2chrom: &[crate::peak_io::NarrowPeak] =
-                lvl2_peaks.peaks_by_chr(chrom).map(|v| v.as_slice()).unwrap_or(&[]);
+            let lvl1chrom: &[crate::peak_io::NarrowPeak] = lvl1_peaks
+                .peaks_by_chr(chrom)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let lvl2chrom: &[crate::peak_io::NarrowPeak] = lvl2_peaks
+                .peaks_by_chr(chrom)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
             let mut tmppeakset: Vec<&crate::peak_io::NarrowPeak> = Vec::new();
             let mut lvl1_iter = lvl1chrom.iter();
@@ -633,18 +638,121 @@ impl BedGraphTrack {
     }
 
     /// Cutoff-analysis report over a range of score thresholds
-    /// (`bedGraphTrackI.cutoff_analysis`). Not needed by the macs-rna paths
-    /// exercised here; left unimplemented.
+    /// (`bedGraphTrackI.cutoff_analysis`).
     pub fn cutoff_analysis(
         &self,
-        _max_gap: i32,
-        _min_length: i32,
-        _steps: i32,
-        _min_score: f32,
-        _max_score: f32,
+        max_gap: i32,
+        min_length: i32,
+        steps: i32,
+        min_score: f32,
+        max_score: f32,
     ) -> String {
-        todo!("Phase 1B: cutoff_analysis (unused by macs-rna paths)")
+        let minv = min_score.max(self.minvalue) as f64;
+        let maxv = max_score.min(self.maxvalue) as f64;
+        if steps <= 0 || maxv <= minv {
+            return "score\tnpeaks\tlpeaks\tavelpeak\n".to_string();
+        }
+
+        let step = (maxv - minv) / steps as f64;
+        let mut cutoff_list: Vec<f32> = Vec::new();
+        let mut v = minv;
+        while v < maxv {
+            cutoff_list.push(round_half_even(v, 3) as f32);
+            v += step;
+        }
+
+        let mut cutoff_npeaks = vec![0_i64; cutoff_list.len()];
+        let mut cutoff_lpeaks = vec![0_i64; cutoff_list.len()];
+
+        for chrom in self.get_chr_names() {
+            let c = self.data.get(chrom).unwrap();
+            let pos = &c.pos;
+            let score = &c.val;
+
+            for (n, &cutoff) in cutoff_list.iter().enumerate() {
+                let mut above: Vec<usize> = Vec::new();
+                for (i, &s) in score.iter().enumerate() {
+                    if s > cutoff {
+                        above.push(i);
+                    }
+                }
+                if above.is_empty() {
+                    continue;
+                }
+
+                let mut peak_content: Vec<(i32, i32)> = Vec::new();
+                for &idx in &above {
+                    let start = if idx == 0 {
+                        *pos.last().unwrap_or(&0)
+                    } else {
+                        pos[idx - 1]
+                    };
+                    peak_content.push((start, pos[idx]));
+                }
+
+                let mut total_l = 0_i64;
+                let mut total_p = 0_i64;
+                let mut current: Vec<(i32, i32)> = vec![peak_content[0]];
+                let mut lastp = peak_content[0].1;
+
+                for &(ts, te) in peak_content.iter().skip(1) {
+                    if ts - lastp <= max_gap {
+                        current.push((ts, te));
+                    } else {
+                        let peak_length = current.last().unwrap().1 - current[0].0;
+                        if peak_length >= min_length {
+                            total_l += peak_length as i64;
+                            total_p += 1;
+                        }
+                        current = vec![(ts, te)];
+                    }
+                    lastp = te;
+                }
+
+                if !current.is_empty() {
+                    let peak_length = current.last().unwrap().1 - current[0].0;
+                    if peak_length >= min_length {
+                        total_l += peak_length as i64;
+                        total_p += 1;
+                    }
+                }
+
+                cutoff_lpeaks[n] += total_l;
+                cutoff_npeaks[n] += total_p;
+            }
+        }
+
+        let mut ret = String::from("score\tnpeaks\tlpeaks\tavelpeak\n");
+        for n in (0..cutoff_list.len()).rev() {
+            if cutoff_npeaks[n] > 0 {
+                ret.push_str(&format!(
+                    "{:.2}\t{}\t{}\t{:.2}\n",
+                    cutoff_list[n],
+                    cutoff_npeaks[n],
+                    cutoff_lpeaks[n],
+                    cutoff_lpeaks[n] as f64 / cutoff_npeaks[n] as f64
+                ));
+            }
+        }
+        ret
     }
+}
+
+fn round_half_even(value: f64, ndigits: i32) -> f64 {
+    let scale = 10_f64.powi(ndigits);
+    let scaled = value * scale;
+    let floor = scaled.floor();
+    let frac = scaled - floor;
+    let rounded = if frac > 0.5 {
+        floor + 1.0
+    } else if frac < 0.5 {
+        floor
+    } else if (floor as i64) % 2 == 0 {
+        floor
+    } else {
+        floor + 1.0
+    };
+    rounded / scale
 }
 
 #[cfg(test)]
@@ -772,6 +880,27 @@ mod tests {
         t.add_loc(b"chr1", 0, 40, 5.0); // length 40 < 50
         let peaks = t.call_peaks(2.0, 50, 30, false);
         assert!(peaks.is_empty());
+    }
+
+    #[test]
+    fn cutoff_analysis_matches_basic_macs_shape() {
+        let mut t = BedGraphTrack::new(0.0);
+        t.add_chrom_data(
+            b"chr1",
+            vec![100, 200, 260, 300, 380],
+            vec![1.0, 5.0, 5.0, 0.0, 4.0],
+        );
+        let report = t.cutoff_analysis(50, 100, 5, 0.0, 5.0);
+        assert_eq!(
+            report,
+            concat!(
+                "score\tnpeaks\tlpeaks\tavelpeak\n",
+                "4.00\t1\t160\t160.00\n",
+                "3.00\t1\t280\t280.00\n",
+                "2.00\t1\t280\t280.00\n",
+                "1.00\t1\t280\t280.00\n",
+            )
+        );
     }
 
     /// Ground-truthed against MACS3 gappedPeak output: a single broad region

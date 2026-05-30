@@ -10,7 +10,7 @@
 //! `call_peaks(cutoff, minlen, maxgap)`, and write narrowPeak.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use clap::Args as ClapArgs;
@@ -44,6 +44,14 @@ pub struct Args {
     #[arg(long = "cutoff-analysis", default_value_t = false)]
     pub cutoff_analysis: bool,
 
+    /// `--cutoff-analysis-max` (dest `cutoff_analysis_max`).
+    #[arg(long = "cutoff-analysis-max", default_value_t = 100)]
+    pub cutoff_analysis_max: i32,
+
+    /// `--cutoff-analysis-steps` (dest `cutoff_analysis_steps`).
+    #[arg(long = "cutoff-analysis-steps", default_value_t = 100)]
+    pub cutoff_analysis_steps: i32,
+
     /// `--no-trackline` (dest `trackline`, `store_false`, default True).
     #[arg(long = "no-trackline", default_value_t = false)]
     pub no_trackline: bool,
@@ -75,22 +83,11 @@ impl Args {
 
 /// Run `bdgpeakcall` (`bdgpeakcall_cmd.py::run`).
 pub fn run(a: &Args) -> anyhow::Result<()> {
-    let btrack = read_bedgraph(&a.ifile)?;
-
-    // cutoff_analysis path is not exercised by the macs-rna harness; only the
-    // call-peaks path is ported.
-    if a.cutoff_analysis {
-        return Err(anyhow::anyhow!(
-            "bdgpeakcall --cutoff-analysis not implemented in macs3-rs"
-        ));
+    if !a.outdir.is_empty() && !Path::new(&a.outdir).exists() {
+        std::fs::create_dir_all(&a.outdir)?;
     }
 
-    let peaks = btrack.call_peaks(
-        a.cutoff as f32,
-        a.minlen,
-        a.maxgap,
-        a.call_summits,
-    );
+    let btrack = read_bedgraph(&a.ifile)?;
 
     // Output filename / prefix selection (bdgpeakcall_cmd.py).
     let (oprefix, fname) = if let Some(ofile) = &a.ofile {
@@ -100,16 +97,38 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
             .oprefix
             .clone()
             .ok_or_else(|| anyhow::anyhow!("either -o/--ofile or --o-prefix is required"))?;
-        let fname = format!(
-            "{}_c{:.1}_l{}_g{}_peaks.narrowPeak",
-            oprefix, a.cutoff, a.minlen, a.maxgap
-        );
+        let fname = if a.cutoff_analysis {
+            format!(
+                "{}_l{}_g{}_cutoff_analysis.txt",
+                oprefix, a.minlen, a.maxgap
+            )
+        } else {
+            format!(
+                "{}_c{:.1}_l{}_g{}_peaks.narrowPeak",
+                oprefix, a.cutoff, a.minlen, a.maxgap
+            )
+        };
         (oprefix, fname)
     };
 
     let out_path = Path::new(&a.outdir).join(&fname);
     let f = File::create(&out_path)?;
     let mut w = BufWriter::new(f);
+
+    if a.cutoff_analysis {
+        let report = btrack.cutoff_analysis(
+            a.maxgap,
+            a.minlen,
+            a.cutoff_analysis_steps,
+            btrack.minvalue,
+            a.cutoff_analysis_max as f32,
+        );
+        w.write_all(report.as_bytes())?;
+        w.flush()?;
+        return Ok(());
+    }
+
+    let peaks = btrack.call_peaks(a.cutoff as f32, a.minlen, a.maxgap, a.call_summits);
 
     let name_prefix = format!("{oprefix}_narrowPeak");
     peaks.write_to_narrow_peak(
@@ -119,7 +138,6 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
         "score",
         a.trackline(),
     )?;
-    use std::io::Write;
     w.flush()?;
     Ok(())
 }

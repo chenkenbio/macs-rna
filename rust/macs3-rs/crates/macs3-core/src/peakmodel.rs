@@ -95,6 +95,10 @@ pub struct PeakModel {
     pub xcorr: Vec<f32>,
     /// Correlation value axis (`ycorr`).
     pub ycorr: Vec<f32>,
+    /// Float64 correlation lag axis, retained for MACS-compatible model R output.
+    pub xcorr64: Vec<f64>,
+    /// Float64 correlation values, retained for MACS-compatible model R output.
+    pub ycorr64: Vec<f64>,
 
     /// Human-readable summary (`__str__` summary).
     pub summary: String,
@@ -373,6 +377,8 @@ impl PeakModel {
         // store profiles / correlation as f32 (public field type).
         self.plus_line = plus_line_i.iter().map(|&v| v as f32).collect();
         self.minus_line = minus_line_i.iter().map(|&v| v as f32).collect();
+        self.ycorr64 = ycorr.clone();
+        self.xcorr64 = xcorr.clone();
         self.ycorr = ycorr.iter().map(|&v| v as f32).collect();
         self.xcorr = xcorr.iter().map(|&v| v as f32).collect();
 

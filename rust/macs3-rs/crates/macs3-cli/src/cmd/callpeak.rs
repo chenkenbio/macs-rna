@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use clap::Args as ClapArgs;
 
+use super::predictd::write_model_r;
 use macs3_core::caller::{bed_tsize, sniff_format};
 use macs3_core::constants::{effective_gsize, MAX_PAIRNUM};
 use macs3_core::parser::{parse_bam, parse_bed, parse_sam};
@@ -66,8 +67,8 @@ pub struct Args {
     pub trackline: bool,
 
     /// `-q/--qvalue` (dest `qvalue`): q-value cutoff.
-    #[arg(short = 'q', long = "qvalue", default_value_t = 0.05)]
-    pub qvalue: f64,
+    #[arg(short = 'q', long = "qvalue", conflicts_with = "pvalue")]
+    pub qvalue: Option<f64>,
 
     /// `-p/--pvalue` (dest `pvalue`): p-value cutoff (overrides q).
     #[arg(short = 'p', long = "pvalue")]
@@ -162,6 +163,10 @@ fn out_path(outdir: &str, name: &str, suffix: &str) -> String {
 
 /// Run `callpeak`. Ports `callpeak_cmd.py::run`.
 pub fn run(a: &Args) -> anyhow::Result<()> {
+    if !a.outdir.is_empty() && !Path::new(&a.outdir).exists() {
+        std::fs::create_dir_all(&a.outdir)?;
+    }
+
     // ---- gsize ----
     let gsize: f64 = match effective_gsize(&a.gsize) {
         Some(g) => g,
@@ -181,10 +186,14 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
     if a.broad && a.call_summits {
         bail!("--broad can't be combined with --call-summits!");
     }
+    if a.cutoff_analysis {
+        bail!("callpeak --cutoff-analysis is not implemented in macs3-rs yet");
+    }
 
     // ---- log p / q ----
     let log_pvalue: Option<f64> = a.pvalue.map(|p| p.log10() * -1.0);
-    let log_qvalue: f64 = a.qvalue.log10() * -1.0;
+    let qvalue = a.qvalue.unwrap_or(0.05);
+    let log_qvalue: f64 = qvalue.log10() * -1.0;
     let log_broadcutoff: f64 = a.broadcutoff.log10() * -1.0;
 
     // mfold lower/upper.
@@ -234,6 +243,7 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
 
     // ---- #2 model / nomodel ----
     let d: i32;
+    let mut peakmodel: Option<PeakModel> = None;
     if a.nomodel {
         d = a.extsize;
     } else {
@@ -248,6 +258,10 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
         match pm.build(&treat) {
             Ok(()) => {
                 d = pm.d;
+                let model_r = out_path(&a.outdir, &a.name, "_model.r");
+                write_model_r(&pm, &model_r, &a.name)
+                    .with_context(|| format!("failed to write R model {model_r}"))?;
+                peakmodel = Some(pm);
             }
             Err(e) => {
                 // onauto is False by default; MACS exits.
@@ -301,7 +315,12 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
             File::create(&bdg_control_path)
                 .with_context(|| format!("failed to create {bdg_control_path}"))?,
         );
-        let d = run_caller(&mut caller, &params, Some(&mut treat_out), Some(&mut ctrl_out));
+        let d = run_caller(
+            &mut caller,
+            &params,
+            Some(&mut treat_out),
+            Some(&mut ctrl_out),
+        );
         treat_out.flush()?;
         ctrl_out.flush()?;
         d
@@ -322,7 +341,15 @@ pub fn run(a: &Args) -> anyhow::Result<()> {
     let tagsinfo = build_tagsinfo(tsize, t0, t1, treatment_max_dup_tags, a, &control);
 
     // ---- #4 outputs ----
-    write_outputs(a, &detected, &argtxt, &tagsinfo, d, log_pvalue)?;
+    write_outputs(
+        a,
+        &detected,
+        &argtxt,
+        &tagsinfo,
+        d,
+        log_pvalue,
+        peakmodel.as_ref(),
+    )?;
 
     Ok(())
 }
@@ -344,6 +371,7 @@ fn write_outputs(
     tagsinfo: &str,
     d: i32,
     log_pvalue: Option<f64>,
+    peakmodel: Option<&PeakModel>,
 ) -> anyhow::Result<()> {
     let name_bytes = a.name.as_bytes();
     let sc = score_column(log_pvalue);
@@ -359,11 +387,27 @@ fn write_outputs(
     write!(xls, "{argtxt}\n")?;
     xls.write_all(tagsinfo.as_bytes())?;
     if a.shift > 0 {
-        write!(xls, "# Sequencing ends will be shifted towards 3' by {} bp(s)\n", a.shift)?;
+        write!(
+            xls,
+            "# Sequencing ends will be shifted towards 3' by {} bp(s)\n",
+            a.shift
+        )?;
     } else if a.shift < 0 {
-        write!(xls, "# Sequencing ends will be shifted towards 5' by {} bp(s)\n", a.shift * -1)?;
+        write!(
+            xls,
+            "# Sequencing ends will be shifted towards 5' by {} bp(s)\n",
+            a.shift * -1
+        )?;
     }
     write!(xls, "# d = {}\n", d)?;
+    if let Some(pm) = peakmodel {
+        let alts: Vec<String> = pm.alternative_d.iter().map(|d| d.to_string()).collect();
+        write!(
+            xls,
+            "# alternative fragment length(s) may be {} bps\n",
+            alts.join(",")
+        )?;
+    }
     if a.nolambda {
         write!(xls, "# local lambda is disabled!\n")?;
     }
@@ -384,7 +428,14 @@ fn write_outputs(
             let sm_path = out_path(&a.outdir, &a.name, "_summits.bed");
             let mut sm = BufWriter::new(File::create(&sm_path)?);
             let desc = format!("Summits for {} (Made with MACS v3)", a.name);
-            peaks.write_to_summit_bed(&mut sm, b"%s_peak_", name_bytes, desc.as_bytes(), sc, a.trackline)?;
+            peaks.write_to_summit_bed(
+                &mut sm,
+                b"%s_peak_",
+                name_bytes,
+                desc.as_bytes(),
+                sc,
+                a.trackline,
+            )?;
             sm.flush()?;
         }
         DetectedPeaks::Broad(bpeaks) => {
@@ -394,13 +445,27 @@ fn write_outputs(
             // broadPeak.
             let bp_path = out_path(&a.outdir, &a.name, "_peaks.broadPeak");
             let mut bp = BufWriter::new(File::create(&bp_path)?);
-            bpeaks.write_to_broad_peak(&mut bp, b"%s_peak_", name_bytes, name_bytes, sc, a.trackline)?;
+            bpeaks.write_to_broad_peak(
+                &mut bp,
+                b"%s_peak_",
+                name_bytes,
+                name_bytes,
+                sc,
+                a.trackline,
+            )?;
             bp.flush()?;
 
             // gappedPeak.
             let gp_path = out_path(&a.outdir, &a.name, "_peaks.gappedPeak");
             let mut gp = BufWriter::new(File::create(&gp_path)?);
-            bpeaks.write_to_gapped_peak(&mut gp, b"%s_peak_", name_bytes, name_bytes, sc, a.trackline)?;
+            bpeaks.write_to_gapped_peak(
+                &mut gp,
+                b"%s_peak_",
+                name_bytes,
+                name_bytes,
+                sc,
+                a.trackline,
+            )?;
             gp.flush()?;
         }
     }
@@ -437,30 +502,50 @@ fn build_argtxt(a: &Args, gsize: f64, log_pvalue: Option<f64>, _d: i32, fmt: &st
 
     if a.pvalue.is_some() {
         if a.broad {
-            s.push_str(&format!("# pvalue cutoff for narrow/strong regions = {:.2e}\n", a.pvalue.unwrap()));
-            s.push_str(&format!("# pvalue cutoff for broad/weak regions = {:.2e}\n", a.broadcutoff));
+            s.push_str(&format!(
+                "# pvalue cutoff for narrow/strong regions = {:.2e}\n",
+                a.pvalue.unwrap()
+            ));
+            s.push_str(&format!(
+                "# pvalue cutoff for broad/weak regions = {:.2e}\n",
+                a.broadcutoff
+            ));
             s.push_str("# qvalue will not be calculated and reported as -1 in the final output.\n");
         } else {
             s.push_str(&format!("# pvalue cutoff = {:.2e}\n", a.pvalue.unwrap()));
             s.push_str("# qvalue will not be calculated and reported as -1 in the final output.\n");
         }
     } else if a.broad {
-        s.push_str(&format!("# qvalue cutoff for narrow/strong regions = {:.2e}\n", a.qvalue));
-        s.push_str(&format!("# qvalue cutoff for broad/weak regions = {:.2e}\n", a.broadcutoff));
+        s.push_str(&format!(
+            "# qvalue cutoff for narrow/strong regions = {:.2e}\n",
+            a.qvalue.unwrap_or(0.05)
+        ));
+        s.push_str(&format!(
+            "# qvalue cutoff for broad/weak regions = {:.2e}\n",
+            a.broadcutoff
+        ));
     } else {
-        s.push_str(&format!("# qvalue cutoff = {:.2e}\n", a.qvalue));
+        s.push_str(&format!(
+            "# qvalue cutoff = {:.2e}\n",
+            a.qvalue.unwrap_or(0.05)
+        ));
     }
     let _ = log_pvalue;
 
     if let Some(mg) = a.maxgap {
-        s.push_str(&format!("# The maximum gap between significant sites = {}\n", mg));
+        s.push_str(&format!(
+            "# The maximum gap between significant sites = {}\n",
+            mg
+        ));
     } else {
         s.push_str("# The maximum gap between significant sites is assigned as the read length/tag size.\n");
     }
     if let Some(ml) = a.minlen {
         s.push_str(&format!("# The minimum length of peaks = {}\n", ml));
     } else {
-        s.push_str("# The minimum length of peaks is assigned as the predicted fragment length \"d\".\n");
+        s.push_str(
+            "# The minimum length of peaks is assigned as the predicted fragment length \"d\".\n",
+        );
     }
 
     if a.scaleto == "large" {
@@ -470,9 +555,15 @@ fn build_argtxt(a: &Args, gsize: f64, log_pvalue: Option<f64>, _d: i32, fmt: &st
     }
 
     if !a.cfile.is_empty() {
-        s.push_str(&format!("# Range for calculating regional lambda is: {} bps and {} bps\n", a.smalllocal, a.largelocal));
+        s.push_str(&format!(
+            "# Range for calculating regional lambda is: {} bps and {} bps\n",
+            a.smalllocal, a.largelocal
+        ));
     } else {
-        s.push_str(&format!("# Range for calculating regional lambda is: {} bps\n", a.largelocal));
+        s.push_str(&format!(
+            "# Range for calculating regional lambda is: {} bps\n",
+            a.largelocal
+        ));
     }
 
     if a.broad {
@@ -482,7 +573,10 @@ fn build_argtxt(a: &Args, gsize: f64, log_pvalue: Option<f64>, _d: i32, fmt: &st
     }
 
     if a.fecutoff != 1.0 {
-        s.push_str(&format!("# Additional cutoff on fold-enrichment is: {:.2}\n", a.fecutoff));
+        s.push_str(&format!(
+            "# Additional cutoff on fold-enrichment is: {:.2}\n",
+            a.fecutoff
+        ));
     }
 
     s.push_str("# Paired-End mode is off\n");
@@ -514,8 +608,14 @@ fn build_tagsinfo(
     s.push_str(&format!("# total tags in treatment: {}\n", t0));
     if a.keepduplicates != "all" {
         s.push_str(&format!("# tags after filtering in treatment: {}\n", t1));
-        s.push_str(&format!("# maximum duplicate tags at the same position in treatment = {}\n", max_dup));
-        s.push_str(&format!("# Redundant rate in treatment: {:.2}\n", (t0 - t1) as f64 / t0 as f64));
+        s.push_str(&format!(
+            "# maximum duplicate tags at the same position in treatment = {}\n",
+            max_dup
+        ));
+        s.push_str(&format!(
+            "# Redundant rate in treatment: {:.2}\n",
+            (t0 - t1) as f64 / t0 as f64
+        ));
     }
     if let Some(ctrl) = control {
         // c0 = total before filter is unknown post-filter; MACS records c0 then
@@ -525,7 +625,10 @@ fn build_tagsinfo(
         s.push_str(&format!("# total tags in control: {}\n", c1));
         if a.keepduplicates != "all" {
             s.push_str(&format!("# tags after filtering in control: {}\n", c1));
-            s.push_str(&format!("# maximum duplicate tags at the same position in control = {}\n", max_dup));
+            s.push_str(&format!(
+                "# maximum duplicate tags at the same position in control = {}\n",
+                max_dup
+            ));
             s.push_str("# Redundant rate in control: 0.00\n");
         }
     }
@@ -565,7 +668,11 @@ fn parse_one(fmt: &str, path: &str, buffer_size: i64) -> anyhow::Result<FwTrack>
 /// For BED, length = `end - start`. SAM/BAM read-length tsize is not needed by
 /// the harness; pass `-s` for those formats.
 fn compute_tsize(fmt: &str, path: &str) -> anyhow::Result<i32> {
-    let resolved = if fmt == "AUTO" { sniff_format(path)? } else { fmt };
+    let resolved = if fmt == "AUTO" {
+        sniff_format(path)?
+    } else {
+        fmt
+    };
     match resolved {
         "BED" => bed_tsize(path).map_err(Into::into),
         other => bail!("tsize determination for format {other:?} is not implemented; pass -s"),
