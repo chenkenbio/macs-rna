@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 
+use rayon::prelude::*;
+
 /// One chromosome's transition points and values (parallel vectors).
 #[derive(Debug, Clone, Default)]
 pub struct ChromData {
@@ -246,12 +248,15 @@ impl BedGraphTrack {
     /// function is applied; it only rewrites values in place. `maxvalue` /
     /// `minvalue` are updated by applying `func` to the previous extremes
     /// (matching the source's `self.maxvalue = func(self.maxvalue)`).
-    pub fn apply_func(&mut self, func: impl Fn(f32) -> f32) {
-        for c in self.data.values_mut() {
+    ///
+    /// Each chromosome's value vector is rewritten in parallel; the extreme
+    /// updates are serial and applied to the stored extremes (not a reduction).
+    pub fn apply_func(&mut self, func: impl Fn(f32) -> f32 + Sync) {
+        self.data.par_iter_mut().for_each(|(_, c)| {
             for v in c.val.iter_mut() {
                 *v = func(*v);
             }
-        }
+        });
         self.maxvalue = func(self.maxvalue);
         self.minvalue = func(self.minvalue);
     }
@@ -323,6 +328,11 @@ impl BedGraphTrack {
     /// gaps no larger than `max_gap`; peaks shorter than `min_length` are
     /// dropped. The `call_summits` flag is accepted for API parity but unused
     /// (MACS always computes a single summit here).
+    ///
+    /// **Phase C (parallel):** each chromosome's segmentation runs independently
+    /// and produces a `Vec<NarrowPeak>` in ascending position order. **Phase D
+    /// (serial):** results are collected into `PeakIO` in bytewise-sorted
+    /// chromosome order, preserving peak-number correctness.
     pub fn call_peaks(
         &self,
         cutoff: f32,
@@ -330,56 +340,83 @@ impl BedGraphTrack {
         max_gap: i32,
         _call_summits: bool,
     ) -> crate::peak_io::PeakIO {
+        let chroms = self.get_chr_names();
+
+        // Phase C: parallel per-chrom segmentation.
+        let per_chrom: Vec<Vec<crate::peak_io::NarrowPeak>> = chroms
+            .par_iter()
+            .map(|&chrom| self.chrom_call_peaks(chrom, cutoff, min_length, max_gap))
+            .collect();
+
+        // Phase D: serial collect into PeakIO in bytewise-sorted chromosome order.
         let mut peaks = crate::peak_io::PeakIO::default();
-        for chrom in self.get_chr_names() {
-            let c = self.data.get(chrom).unwrap();
-            let ps = &c.pos;
-            let vs = &c.val;
-            // peak_content: list of (start, end, value)
-            let mut peak_content: Vec<(i32, i32, f32)> = Vec::new();
-            let mut pre_p: i32 = 0;
-            // Find the first region above cutoff.
-            let mut x: usize = 0;
-            let mut started = false;
-            while x < ps.len() {
-                let p = ps[x];
-                let v = vs[x];
-                x += 1;
-                if v >= cutoff {
-                    peak_content.push((pre_p, p, v));
-                    pre_p = p;
-                    started = true;
-                    break;
-                } else {
-                    pre_p = p;
-                }
+        for (chrom, chrom_peaks) in chroms.iter().zip(per_chrom.into_iter()) {
+            for peak in chrom_peaks {
+                peaks.add_peak_content(chrom, peak);
             }
-            if !started {
-                continue;
-            }
-            // Continue scanning the remaining regions.
-            for i in x..ps.len() {
-                let p = ps[i];
-                let v = vs[i];
-                if v < cutoff {
-                    pre_p = p;
-                    continue;
-                }
-                // For points above cutoff: gap = pre_p - last segment end.
-                if pre_p - peak_content.last().unwrap().1 <= max_gap {
-                    peak_content.push((pre_p, p, v));
-                } else {
-                    Self::close_peak(&peak_content, &mut peaks, min_length, chrom);
-                    peak_content = vec![(pre_p, p, v)];
-                }
-                pre_p = p;
-            }
-            if peak_content.is_empty() {
-                continue;
-            }
-            Self::close_peak(&peak_content, &mut peaks, min_length, chrom);
         }
         peaks
+    }
+
+    /// Per-chromosome narrow-peak segmentation (Phase C helper).
+    ///
+    /// Returns peaks in ascending position order (insertion order == coordinate
+    /// order here, matching the serial algorithm). No shared mutable state —
+    /// safe to call in parallel across chromosomes.
+    fn chrom_call_peaks(
+        &self,
+        chrom: &[u8],
+        cutoff: f32,
+        min_length: i32,
+        max_gap: i32,
+    ) -> Vec<crate::peak_io::NarrowPeak> {
+        let c = self.data.get(chrom).unwrap();
+        let ps = &c.pos;
+        let vs = &c.val;
+        let mut result: Vec<crate::peak_io::NarrowPeak> = Vec::new();
+        // peak_content: list of (start, end, value)
+        let mut peak_content: Vec<(i32, i32, f32)> = Vec::new();
+        let mut pre_p: i32 = 0;
+        // Find the first region above cutoff.
+        let mut x: usize = 0;
+        let mut started = false;
+        while x < ps.len() {
+            let p = ps[x];
+            let v = vs[x];
+            x += 1;
+            if v >= cutoff {
+                peak_content.push((pre_p, p, v));
+                pre_p = p;
+                started = true;
+                break;
+            } else {
+                pre_p = p;
+            }
+        }
+        if !started {
+            return result;
+        }
+        // Continue scanning the remaining regions.
+        for i in x..ps.len() {
+            let p = ps[i];
+            let v = vs[i];
+            if v < cutoff {
+                pre_p = p;
+                continue;
+            }
+            // For points above cutoff: gap = pre_p - last segment end.
+            if pre_p - peak_content.last().unwrap().1 <= max_gap {
+                peak_content.push((pre_p, p, v));
+            } else {
+                Self::close_peak(&peak_content, &mut result, min_length, chrom);
+                peak_content = vec![(pre_p, p, v)];
+            }
+            pre_p = p;
+        }
+        if !peak_content.is_empty() {
+            Self::close_peak(&peak_content, &mut result, min_length, chrom);
+        }
+        result
     }
 
     /// Convert buffered segments into a peak entry if `peak_length >=
@@ -388,9 +425,12 @@ impl BedGraphTrack {
     /// Summit = midpoint `(tstart+tend)/2` (C int truncation) of the
     /// maximum-value segment; on ties the chosen index is `(len+1)/2 - 1`
     /// (C int division). The peak score column is the summit value.
+    ///
+    /// Pushes into the caller's local `Vec<NarrowPeak>` so this function is
+    /// free of shared-state side effects (Phase C safe).
     fn close_peak(
         peak_content: &[(i32, i32, f32)],
-        peaks: &mut crate::peak_io::PeakIO,
+        peaks: &mut Vec<crate::peak_io::NarrowPeak>,
         min_length: i32,
         chrom: &[u8],
     ) {
@@ -414,8 +454,8 @@ impl BedGraphTrack {
         // tie index: (len+1)//2 - 1 (C int division).
         let idx = ((tsummit.len() as i32 + 1) / 2 - 1) as usize;
         let summit = tsummit[idx];
-        peaks.add(
-            chrom,
+        peaks.push(crate::peak_io::NarrowPeak::new(
+            chrom.to_vec(),
             peak_content[0].0,
             peak_content.last().unwrap().1,
             summit,
@@ -424,8 +464,8 @@ impl BedGraphTrack {
             0.0,
             0.0,
             0.0,
-            b"",
-        );
+            b"".to_vec(),
+        ));
     }
 
     /// Call broad peaks from high- and low-stringency thresholds
